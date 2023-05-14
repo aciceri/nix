@@ -23,7 +23,7 @@
       linuxSystems = linux64BitSystems ++ [ "i686-linux" ];
       systems = linuxSystems ++ [ "x86_64-darwin" "aarch64-darwin" ];
 
-      crossSystems = [ "armv6l-linux" "armv7l-linux" ];
+      crossSystems = [ "riscv64-linux" "armv6l-linux" "armv7l-linux" ];
 
       stdenvs = [ "gccStdenv" "clangStdenv" "clang11Stdenv" "stdenv" "libcxxStdenv" "ccacheStdenv" ];
 
