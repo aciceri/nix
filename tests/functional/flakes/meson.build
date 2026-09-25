@@ -22,6 +22,7 @@ suites += {
     'prefetch.sh',
     'eval-cache.sh',
     'eval-daemon.sh',
+    'eval-daemon-cells.sh',
     'search-root.sh',
     'config.sh',
     'show.sh',

@@ -1,4 +1,5 @@
 #include "nix/expr/eval.hh"
+#include "nix/expr/traced-cells.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/primops.hh"
@@ -1148,6 +1149,9 @@ struct ExprParseFile : Expr, gc
                 state.error<EvalError>("file '%s' must be an attribute set", path).debugThrow();
 
             state.eval(e, v);
+
+            if (state.cells)
+                state.cells->registerFile(path, v);
         } catch (Error & e) {
             state.addErrorTrace(e, "while evaluating the file '%s':", path.to_string());
             throw;
@@ -1201,6 +1205,8 @@ void EvalState::resetFileCache()
     inputCache->clear();
     lookupPathResolved->clear();
     rootFS->invalidateCache();
+    if (cells)
+        cells->clear();
 }
 
 void EvalState::startGeneration()
@@ -1221,7 +1227,19 @@ void EvalState::startGeneration()
     importResolutionCache->erase_if(
         [&](auto & entry) { return !isLongLived(entry.first) || !isLongLived(entry.second); });
 
+    if (cells)
+        cells->startGeneration(*this);
+
     generation++;
+}
+
+void EvalState::enableCells(std::vector<std::string> fileSuffixes, size_t maxInstances)
+{
+#if NIX_USE_BOEHMGC
+    cells = std::make_unique<CellTable>(*this, std::move(fileSuffixes), maxInstances);
+#else
+    throw Error("traced cells require Nix to be built with the Boehm garbage collector");
+#endif
 }
 
 size_t EvalState::fileEvalCacheSize() const
@@ -1634,6 +1652,13 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
         if (vCur.isLambda()) {
 
             ExprLambda & lambda(*vCur.lambda().fun);
+
+            if (lambda.cellSite && cells) [[unlikely]] {
+                if (cells->call(*this, vCur, *args[0], vCur, pos)) {
+                    args = args.subspan(1);
+                    continue;
+                }
+            }
 
             auto size = (!lambda.arg ? 0 : 1) + (lambda.getFormals() ? lambda.getFormals()->formals.size() : 0);
             Env & env2(mem.allocEnv(size));
@@ -2264,6 +2289,13 @@ void ExprPos::eval(EvalState & state, Env & env, Value & v)
     state.mkPos(v, pos);
 }
 
+ExprLazyApp eLazyApp;
+
+void ExprLazyApp::eval(EvalState & state, Env & env, Value & v)
+{
+    state.callFunction(*env.values[0], *env.values[1], v, noPos);
+}
+
 void ExprBlackHole::eval(EvalState & state, [[maybe_unused]] Env & env, Value & v)
 {
     throwInfiniteRecursionError(state, v);
@@ -2303,6 +2335,15 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
         recovery = allocValue();
     } catch (...) {
     }
+    if (speculative) [[unlikely]] {
+        /* Traced-cell validation forced this value although a cold
+           evaluation might never force it, so the error must not stick.
+           A black hole belongs to an evaluation further up the stack. */
+        if (!env)
+            return;
+        if (!recovery)
+            recovery = allocValue();
+    }
     if (recovery) {
         recovery->mkThunk(env, expr);
     }
@@ -2322,6 +2363,8 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
         recovery = allocValue();
     } catch (...) {
     }
+    if (speculative && !recovery) [[unlikely]]
+        recovery = allocValue();
     if (recovery) {
         *recovery = savedApp;
     }
@@ -2989,8 +3032,11 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
     /* !!! Hack to support some old broken code that relies on pointer
        equality tests between sets.  (Specifically, builderDefs calls
        uniqList on a list of sets.)  Will remove this eventually. */
-    if (&v1 == &v2)
+    if (&v1 == &v2) {
+        if (cells) [[unlikely]]
+            cells->observeIdentity(v1);
         return true;
+    }
 
     // Special case type-compatibility between float and int
     if (v1.type() == nInt && v2.type() == nFloat)
@@ -3050,8 +3096,15 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
     }
 
-    /* Functions are incomparable. */
+    /* Functions are incomparable. The result would have been true for
+       identical values, so it depends on their identity. */
     case nFunction:
+        if (cells) [[unlikely]] {
+            cells->observeIdentity(v1);
+            cells->observeIdentity(v2);
+            if (cells->sameBacking(*this, v1, v2))
+                return true;
+        }
         return false;
 
     case nExternal:

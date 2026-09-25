@@ -197,6 +197,14 @@ typedef boost::unordered_flat_map<PosIdx, DocComment, std::hash<PosIdx>> DocComm
 struct Env
 {
     Env * up;
+
+    /**
+     * The evaluation context in which this environment was allocated:
+     * a traced cell (`CellInstance`), or null for ordinary evaluation. See
+     * `EvalMemory::currentOwner`.
+     */
+    void * owner;
+
     Value * values[0];
 };
 
@@ -230,6 +238,7 @@ struct WhileTryingToUse
 std::ostream & operator<<(std::ostream & os, WhileTryingToUse w);
 
 struct RegexCache;
+struct CellTable;
 
 ref<RegexCache> makeRegexCache();
 
@@ -367,6 +376,19 @@ public:
     inline void * allocBytes(size_t n);
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
+
+    /**
+     * The context of the evaluation in progress (a traced cell's
+     * `CellInstance`, or null for ordinary evaluation), recorded in every
+     * new `Env`: forcing a thunk runs in the context of its environment,
+     * so a thunk created while computing a traced cell's result keeps the
+     * cell's context when forced later from elsewhere. Applications
+     * created by primops in a cell's context are thunks too
+     * (`EvalState::mkLazyApp()`); a `tApp` runs in the context of its
+     * lambda. Traced cells use it to tell calls made for a cell apart
+     * from calls made by ordinary evaluation.
+     */
+    void * currentOwner = nullptr;
 
     Bindings * allocBindings(size_t capacity);
 
@@ -664,6 +686,22 @@ public:
     void resetFileCache();
 
     /**
+     * `v.mkApp(fun, arg)`, but as a thunk that keeps the current context
+     * when that is a traced cell's (see `EvalMemory::currentOwner`).
+     */
+    void mkLazyApp(Value & v, Value * fun, Value * arg)
+    {
+        if (!mem.currentOwner) {
+            v.mkApp(fun, arg);
+            return;
+        }
+        Env & env = mem.allocEnv(2);
+        env.values[0] = fun;
+        env.values[1] = arg;
+        v.mkThunk(&env, &eLazyApp);
+    }
+
+    /**
      * Start a new evaluation in a long-lived `EvalState` (for example
      * `nix eval-daemon`). Drops the per-evaluation caches (fetched inputs,
      * Git work tree info, lookup path resolution, filesystem metadata) so
@@ -689,6 +727,25 @@ public:
     }
 
     size_t fileEvalCacheSize() const;
+
+    /**
+     * Traced cells (doc/traced-cells/DESIGN.md), only in a long-lived
+     * `EvalState` that calls `startGeneration()`. Null when disabled.
+     */
+    std::unique_ptr<CellTable> cells;
+
+    /**
+     * Make applications of the file-level lambdas with formals of files
+     * whose path ends with one of `fileSuffixes` traced cells. Requires the
+     * Boehm GC.
+     */
+    void enableCells(std::vector<std::string> fileSuffixes, size_t maxInstances);
+
+    /**
+     * Nonzero while traced cells are being validated: values are forced
+     * speculatively, so errors must not be cached in thunks.
+     */
+    unsigned int speculative = 0;
 
     /**
      * Look up a file in the search path.

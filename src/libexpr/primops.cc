@@ -4,6 +4,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/traced-cells.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/static-string-data.hh"
@@ -3222,9 +3223,13 @@ static void prim_unsafeGetAttrPos(EvalState & state, CallSite callSite, Value * 
     auto attr = state.forceStringNoCtx(
         *args[0], noPos, "while evaluating the first argument passed to builtins.unsafeGetAttrPos");
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.unsafeGetAttrPos");
-    auto i = args[1]->attrs()->get(state.symbols.create(attr));
+    auto name = state.symbols.create(attr);
+    auto i = args[1]->attrs()->get(name);
     if (!i)
         v.mkNull();
+    else if (auto pos = state.cells ? state.cells->attrPos(args[1]->attrs(), name) : std::nullopt)
+        /* A traced-cell proxy: report (and record) the current position. */
+        state.mkPos(v, *pos);
     else
         state.mkPos(v, i->pos);
 }
@@ -3582,14 +3587,22 @@ static RegisterPrimOp primop_catAttrs({
 static void prim_functionArgs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceValue(*args[0], noPos);
-    if (args[0]->isPrimOpApp() || args[0]->isPrimOp()) {
+    Value * fn = args[0];
+    /* Look through traced-cell proxies to the function they denote. */
+    while (state.cells)
+        if (auto backing = state.cells->observeFunctionArgs(state, *fn)) {
+            state.forceValue(*backing, noPos);
+            fn = backing;
+        } else
+            break;
+    if (fn->isPrimOpApp() || fn->isPrimOp()) {
         v.mkAttrs(&Bindings::emptyBindings);
         return;
     }
-    if (!args[0]->isLambda())
+    if (!fn->isLambda())
         state.error<TypeError>("'functionArgs' requires a function").atPos(noPos).debugThrow();
 
-    if (const auto & formals = args[0]->lambda().fun->getFormals()) {
+    if (const auto & formals = fn->lambda().fun->getFormals()) {
         auto attrs = state.buildBindings(formals->formals.size());
         for (auto & i : formals->formals)
             attrs.insert(i.name, state.getBool(i.def), i.pos);
@@ -3634,8 +3647,8 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
     for (auto & i : *args[1]->attrs()) {
         Value * vName = Value::toPtr(state.symbols[i.name]);
         Value * vFun2 = state.allocValue();
-        vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+        state.mkLazyApp(*vFun2, args[0], vName);
+        state.mkLazyApp(attrs.alloc(i.name), vFun2, i.value);
     }
 
     v.mkAttrs(attrs.alreadySorted());
@@ -3704,11 +3717,11 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
     for (auto & [sym, elem] : attrsSeen) {
         auto name = Value::toPtr(state.symbols[sym]);
         auto call1 = state.allocValue();
-        call1->mkApp(args[0], name);
+        state.mkLazyApp(*call1, args[0], name);
         auto call2 = state.allocValue();
         auto arg = state.allocValue();
         arg->mkList(*elem.list);
-        call2->mkApp(call1, arg);
+        state.mkLazyApp(*call2, call1, arg);
         attrs.insert(sym, call2);
     }
 
@@ -3862,7 +3875,7 @@ static void prim_map(EvalState & state, CallSite callSite, Value * const * args,
 
     auto list = state.buildList(args[1]->listSize());
     for (const auto & [n, v] : enumerate(list))
-        (v = state.allocValue())->mkApp(args[0], args[1]->listView()[n]);
+        state.mkLazyApp(*(v = state.allocValue()), args[0], args[1]->listView()[n]);
     v.mkList(list);
 }
 
@@ -4137,7 +4150,7 @@ static void prim_genList(EvalState & state, CallSite callSite, Value * const * a
     for (const auto & [n, v] : enumerate(list)) {
         auto arg = state.allocValue();
         arg->mkInt(n);
-        (v = state.allocValue())->mkApp(args[0], arg);
+        state.mkLazyApp(*(v = state.allocValue()), args[0], arg);
     }
     v.mkList(list);
 }

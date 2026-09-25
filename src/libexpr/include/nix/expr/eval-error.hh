@@ -105,6 +105,12 @@ MakeError(IFDError, EvalBaseError);
  */
 MakeError(RecoverableEvalError, EvalBaseError);
 
+/**
+ * A traced cell that was reused turned out to be invalid (see
+ * `CellTable::checkDeferred()`); the evaluation must be started again.
+ */
+MakeError(CellInvalidated, RecoverableEvalError);
+
 class InvalidPathError : public CloneableError<InvalidPathError, EvalError>
 {
     void anchor() override;

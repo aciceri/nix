@@ -89,6 +89,7 @@ Env & EvalMemory::allocEnv(size_t size)
 
     /* We assume that env->values has been cleared by the allocator; maybeThunk() and lookupVar fromWith expect this. */
 
+    env->owner = currentOwner;
     return *env;
 }
 
@@ -99,24 +100,39 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
+        auto savedOwner = mem.currentOwner;
         try {
             v.mkBlackhole();
-            if (env) [[likely]]
+            if (env) [[likely]] {
+                mem.currentOwner = env->owner;
                 expr->eval(*this, *env, v);
-            else
+            } else
                 ExprBlackHole::throwInfiniteRecursionError(*this, v);
         } catch (...) {
+            mem.currentOwner = savedOwner;
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
+        mem.currentOwner = savedOwner;
     } else if (v.isApp()) {
         Value savedApp = v;
+        auto savedOwner = mem.currentOwner;
+        /* An application has no environment. Applications created in a
+           traced cell's context are thunks (`mkLazyApp()`), so this one
+           was created by ordinary evaluation; it runs in the context of
+           the applied lambda's closure, if any. */
+        auto * fn = v.app().left;
+        while (fn->isApp())
+            fn = fn->app().left;
+        mem.currentOwner = fn->isLambda() ? fn->lambda().env->owner : nullptr;
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);
         } catch (...) {
+            mem.currentOwner = savedOwner;
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
+        mem.currentOwner = savedOwner;
     } else if (v.isFailed()) {
         handleEvalFailed(v, pos);
     }

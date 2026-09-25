@@ -122,6 +122,7 @@ template class EvalErrorBuilder<StackOverflowError>;
 template class EvalErrorBuilder<InvalidPathError>;
 template class EvalErrorBuilder<IFDError>;
 template class EvalErrorBuilder<RecoverableEvalError>;
+template class EvalErrorBuilder<CellInvalidated>;
 
 void EvalBaseError::anchor() {}
 
@@ -150,5 +151,7 @@ void InvalidPathError::anchor() {}
 void IFDError::anchor() {}
 
 void RecoverableEvalError::anchor() {}
+
+void CellInvalidated::anchor() {}
 
 } // namespace nix

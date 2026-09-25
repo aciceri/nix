@@ -6,6 +6,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/attr-path.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/expr/traced-cells.hh"
 #include "nix/flake/flake.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/store-api.hh"
@@ -27,6 +28,11 @@ namespace nix {
 using json = nlohmann::json;
 
 namespace {
+
+/**
+ * Evaluations of one request after reused traced cells were found invalid.
+ */
+constexpr unsigned int maxAttempts = 5;
 
 double secondsSince(std::chrono::steady_clock::time_point start)
 {
@@ -52,6 +58,9 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
 {
     std::optional<std::filesystem::path> socketPath;
     bool verify = false;
+    bool cells = true;
+    std::vector<std::string> cellFiles;
+    size_t maxCells = 16;
 
     CmdEvalDaemon()
     {
@@ -66,6 +75,25 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
             .description = "After every `eval` request, evaluate the same installable cold in a child process "
                            "and report whether the results are identical.",
             .handler = {&verify, true},
+        });
+        addFlag({
+            .longName = "no-cells",
+            .description = "Only reuse evaluated files; do not reuse applications of cell sites.",
+            .handler = {&cells, false},
+        });
+        addFlag({
+            .longName = "cell-file",
+            .description =
+                "Make the file-level function of files whose path ends with *suffix* a cell site. "
+                "Can be given multiple times; the default is `/pkgs/top-level/impure.nix` (`import nixpkgs { ... }`).",
+            .labels = {"suffix"},
+            .handler = {[&](std::string s) { cellFiles.push_back(s); }},
+        });
+        addFlag({
+            .longName = "max-cells",
+            .description = "Keep at most *n* cell instances (default: 16).",
+            .labels = {"n"},
+            .handler = {[&](std::string s) { maxCells = string2IntWithUnitPrefix<size_t>(s); }},
         });
     }
 
@@ -100,6 +128,10 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
 
         if (verify && (!lockFlags.inputOverrides.empty() || !lockFlags.inputUpdates.empty()))
             throw UsageError("'--verify' cannot be combined with flags that change the lock file");
+
+        if (cells)
+            getEvalState()->enableCells(
+                cellFiles.empty() ? std::vector<std::string>{"/pkgs/top-level/impure.nix"} : cellFiles, maxCells);
 
         if (!socketPath) {
             serve(getStandardInput(), getStandardOutput());
@@ -151,9 +183,12 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
             json response;
             if (command == "eval" && !arg.empty())
                 response = handleEval(arg);
-            else if (command == "stats")
-                response = {{"ok", true}, {"stats", getEvalState()->getStatistics()}};
-            else if (command == "gc" || command == "reset") {
+            else if (command == "stats") {
+                auto state = getEvalState();
+                response = {{"ok", true}, {"stats", state->getStatistics()}};
+                if (state->cells)
+                    response["cells"] = state->cells->instancesJson(*state);
+            } else if (command == "gc" || command == "reset") {
                 auto state = getEvalState();
                 if (command == "reset")
                     state->resetFileCache();
@@ -189,6 +224,7 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
 
         auto start = std::chrono::steady_clock::now();
         auto before = state->getStatistics();
+        auto cellsBefore = state->cells ? state->cells->stats : CellTable::Stats{};
 
         /* Collect the previous generation now, while the C++ stack is
            shallow. Boehm scans the stack conservatively, and a deep
@@ -200,14 +236,39 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         state->fullGC();
         auto startGcTime = secondsSince(start);
         json response;
-        try {
-            response = evaluate(*state, installable);
-        } catch (Error & e) {
-            /* A failed evaluation may leave failed thunks inside cached
-               file values, and the failure may not recur (for example a
-               fetch or build error), so start the next request clean. */
-            state->resetFileCache();
-            response = {{"ok", false}, {"error", filterANSIEscapes(e.msg(), true)}};
+        unsigned int attempts = 0;
+        while (true) {
+            attempts++;
+            bool retry = false;
+            try {
+                response = evaluate(*state, installable);
+                /* Reused cells may have deferred part of their validation
+                   until the result is known. */
+                retry = state->cells && !state->cells->checkDeferred(*state);
+            } catch (CellInvalidated &) {
+                retry = true;
+            } catch (Error & e) {
+                /* An error may come from a reused cell that turns out to
+                   be invalid; otherwise it is the result. A failed
+                   evaluation may leave failed thunks inside cached file
+                   values, and the failure may not recur (for example a
+                   fetch or build error), so start the next request clean. */
+                if (state->cells && !state->cells->checkDeferred(*state))
+                    retry = true;
+                else {
+                    state->resetFileCache();
+                    response = {{"ok", false}, {"error", filterANSIEscapes(e.msg(), true)}};
+                }
+            }
+            if (!retry)
+                break;
+            if (attempts == maxAttempts) {
+                state->resetFileCache();
+                response = {{"ok", false}, {"error", "traced cells kept being invalidated"}};
+                break;
+            }
+            notice("generation %d: reused traced cells were invalid, evaluating again", state->getGeneration());
+            state->cells->retry();
         }
 
         auto after = state->getStatistics();
@@ -215,6 +276,7 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
             {"generation", state->getGeneration()},
             {"wallTime", secondsSince(start)},
             {"startGcTime", startGcTime},
+            {"attempts", attempts},
             {"cpuTime", after.at("cpuTime").get<double>() - before.at("cpuTime").get<double>()},
             {"gcTime", gcTime(after) - gcTime(before)},
             {"fileEvalCacheSize", state->fileEvalCacheSize()},
@@ -225,6 +287,17 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         if (Counter::enabled)
             for (auto key : {"nrThunks", "nrFunctionCalls"})
                 response["stats"][key] = after.at(key).get<uint64_t>() - before.at(key).get<uint64_t>();
+        if (state->cells) {
+            auto & now = state->cells->stats;
+            auto cells = state->cells->statsJson();
+            cells["hits"] = now.hits - cellsBefore.hits;
+            cells["misses"] = now.misses - cellsBefore.misses;
+            cells["rejected"] = now.rejected - cellsBefore.rejected;
+            cells["deferred"] = now.deferred - cellsBefore.deferred;
+            cells["invalidated"] = now.invalidated - cellsBefore.invalidated;
+            cells["validationTime"] = now.validationSeconds - cellsBefore.validationSeconds;
+            response["stats"]["cells"] = std::move(cells);
+        }
 
         notice(
             "generation %d: %s: %s in %.2f s",

@@ -46,20 +46,24 @@ Requests are single lines; every response is a single line of JSON.
   response contains its store derivation path (`"kind": "drvPath"`),
   otherwise the value as JSON (`"kind": "json"`). `stats` reports the CPU and
   garbage collector time, thunks and function calls of this request, the heap
-  size and the number of cached files.
+  size, the number of cached files, the number of evaluations of the request
+  (`attempts`) and, in `cells`, the cells reused (`hits`), created
+  (`misses`), rejected by replay (`rejected`), checked after the request
+  (`deferred`) and found invalid then (`invalidated`).
 
   With `--verify`, the daemon then runs `nix eval --no-eval-cache` on the same
   installable in a child process and reports in `verify.matches` whether the
   cold result is identical. The child uses the configuration files and
   `--read-only`, but no other command line options of the daemon.
 
-  If an evaluation fails, the daemon drops all cached files, because a failed
-  evaluation can leave failed thunks behind.
+  If an evaluation fails, the daemon drops all cached files and cells,
+  because a failed evaluation can leave failed thunks behind.
 
 * `stats`
 
   Print the evaluator statistics of the whole process, in the format of
-  [`NIX_SHOW_STATS`](@docroot@/command-ref/env-common.md#env-NIX_SHOW_STATS).
+  [`NIX_SHOW_STATS`](@docroot@/command-ref/env-common.md#env-NIX_SHOW_STATS),
+  and the cached cells.
 
 * `gc`
 
@@ -68,10 +72,35 @@ Requests are single lines; every response is a single line of JSON.
 
 * `reset`
 
-  Drop all cached files, then behave like `gc`.
+  Drop all cached files and cells, then behave like `gc`.
 
 * `quit`
 
   Stop the daemon.
+
+# Traced cells
+
+The daemon also reuses *applications* of selected functions across requests,
+by default `import nixpkgs { ... }` (the function of
+`pkgs/top-level/impure.nix`; see `--cell-file`). Such a *cell* does not see
+its argument directly: it reads it through proxies that record what it
+looked at (attribute names, list lengths, primitive values, results of
+calling functions of the argument such as overlays or
+`allowUnfreePredicate`). In a later request the recorded reads are replayed
+against the new argument, and the previous result is reused only if they
+all give the same answers. The reused result keeps reading the argument
+through the proxies, so values it had not looked at yet come from the new
+argument.
+
+Reads that cannot be replayed before the result exists (they depend on the
+result, for example a NixOS option read by an overlay) are checked when the
+request is done; if one changed, the request is evaluated again without
+that cell (`stats.attempts`). A call site whose cell records more than
+100 000 reads (for example because the argument replaces `lib`) is no longer
+traced.
+
+Messages printed by `builtins.trace` and warnings may be printed while
+reads are replayed, and positions in error messages that come from the
+argument may be those of an earlier request.
 
 )""
