@@ -26,6 +26,9 @@ numbers behind the design, the repository state and the rules.
   flake keep their identity), then cells for module function applications
   (stable definition objects), then option merge cells (P3), then
   persistence (P4).
+- Use: `projects/fasteval/fasteval.py` in `universe` (`eval|build|switch
+  HOST`, starts the daemon on `$XDG_RUNTIME_DIR/fasteval.sock`); write mode
+  3.5-3.9 s per pike request after the first. Switching was never run.
 - Tests: `meson test -C build --suite flakes eval-daemon eval-daemon-cells`
   (functional),
   `cycle.py run --daemon ...` (acceptance on `universe`, see NOTES.md).
