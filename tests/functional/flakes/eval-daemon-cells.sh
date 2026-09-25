@@ -27,6 +27,11 @@ builtins.trace "instantiating" (
       same = config.a == config.b;
       args = builtins.attrNames (builtins.functionArgs config.fn);
       line = (builtins.unsafeGetAttrPos "greeting" config).line;
+      drv = derivation {
+        name = "eval-daemon-cell-${config.greeting}";
+        builder = "/bin/sh";
+        system = "x86_64-linux";
+      };
     };
     extend = f: o: final: let prev = f final; in prev // o final prev;
     fix = f: let x = f x; in x;
@@ -48,7 +53,7 @@ cat > "$flakeDir/flake.nix" <<EOF
         config = import ./config.nix // { a = { f = shared; }; b = { f = shared; }; };
         overlays = [ (import ./overlay.nix) ];
       };
-    in { inherit (p) greeting unfree lazy same extra args line; };
+    in { inherit (p) greeting unfree lazy same extra args line drv; };
 }
 EOF
 cat > "$flakeDir/config.nix" <<'EOF'
@@ -115,6 +120,19 @@ check unfree true 1 0
 check line 2 1 0
 sed -i 's/^{$/{\n  # moved/' "$flakeDir/config.nix"
 check line 3 0 1
+
+# A reused cell does not write its store derivations again; they stay
+# valid because the daemon holds them as temporary roots.
+echo "eval git+file://$flakeDir#drv" >&"${DAEMON[1]}"
+read -r reply <&"${DAEMON[0]}"
+drvPath=$(jq -r .value <<< "$reply")
+nix-store --delete "$drvPath" || true
+echo 3 > "$flakeDir/unrelated.nix"
+echo "eval git+file://$flakeDir#drv" >&"${DAEMON[1]}"
+read -r reply <&"${DAEMON[0]}"
+echo "drv: $reply" >&2
+[[ $(jq -r .value <<< "$reply") == "$drvPath" ]]
+nix path-info "$drvPath"
 
 # A value of the argument that depends on the cell's own result cannot be
 # checked when the cell is looked up (the result is being computed); it is

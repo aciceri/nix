@@ -99,6 +99,13 @@ that cell (`stats.attempts`). A call site whose cell records more than
 100 000 reads (for example because the argument replaces `lib`) is no longer
 traced.
 
+Unless `--read-only` is given, derivations are written to the store as
+usual; a reused result does not write them again. The daemon keeps every
+path it added as a temporary garbage collector root while it runs, so they
+stay valid; if the result's store derivation is missing anyway, or
+evaluation fails on a missing store path, the request is evaluated again
+without reusing anything.
+
 Messages printed by `builtins.trace` and warnings may be printed while
 reads are replayed, and positions in error messages that come from the
 argument may be those of an earlier request.

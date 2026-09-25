@@ -294,16 +294,38 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         auto prepareTime = secondsSince(start);
         json response;
         unsigned int attempts = 0;
+        /* Set once the request is being evaluated without reusing any
+           cell or evaluated file. */
+        bool fromScratch = false;
         while (true) {
             attempts++;
-            bool retry = false;
+            enum class Next { Done, Retry, FromScratch } next = Next::Done;
             try {
                 response = evaluate(*state, installable);
                 /* Reused cells may have deferred part of their validation
                    until the result is known. */
-                retry = state->cells && !state->cells->checkDeferred(*state);
+                if (state->cells && !state->cells->checkDeferred(*state))
+                    next = Next::Retry;
+                /* Reused values do not write their store derivations
+                   again; if a garbage collection deleted one, the result
+                   is not in the store (a valid path's references are
+                   valid, so checking the result suffices). */
+                else if (
+                    !fromScratch && !settings.readOnlyMode && response["kind"] == "drvPath"
+                    && !state->store->isValidPath(state->store->parseStorePath(response["value"].get<std::string>())))
+                    next = Next::FromScratch;
             } catch (CellInvalidated &) {
-                retry = true;
+                next = Next::Retry;
+            } catch (InvalidPath & e) {
+                /* Typically a new derivation depending on a store
+                   derivation of a reused value that was garbage
+                   collected. */
+                if (!fromScratch)
+                    next = Next::FromScratch;
+                else {
+                    state->resetFileCache();
+                    response = {{"ok", false}, {"error", filterANSIEscapes(e.msg(), true)}};
+                }
             } catch (Error & e) {
                 /* An error may come from a reused cell that turns out to
                    be invalid; otherwise it is the result. A failed
@@ -311,21 +333,29 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
                    values, and the failure may not recur (for example a
                    fetch or build error), so start the next request clean. */
                 if (state->cells && !state->cells->checkDeferred(*state))
-                    retry = true;
+                    next = Next::Retry;
                 else {
                     state->resetFileCache();
                     response = {{"ok", false}, {"error", filterANSIEscapes(e.msg(), true)}};
                 }
             }
-            if (!retry)
+            if (next == Next::Done)
                 break;
             if (attempts == maxAttempts) {
                 state->resetFileCache();
                 response = {{"ok", false}, {"error", "traced cells kept being invalidated"}};
                 break;
             }
-            notice("generation %d: reused traced cells were invalid, evaluating again", state->getGeneration());
-            state->cells->retry();
+            if (next == Next::FromScratch) {
+                notice(
+                    "generation %d: reused values refer to store derivations that are gone, evaluating again from scratch",
+                    state->getGeneration());
+                state->resetFileCache();
+                fromScratch = true;
+            } else {
+                notice("generation %d: reused traced cells were invalid, evaluating again", state->getGeneration());
+                state->cells->retry();
+            }
         }
 
         auto after = state->getStatistics();
