@@ -334,10 +334,14 @@ guaranteed miss.
   evaluation runs over stack slots where the previous deep evaluation left
   stale pointers, so collections during generation N+1 kept most of
   generation N alive (pike: +1.5 GiB live heap per generation, OOM after
-  about 20 generations with five hosts). The daemon therefore runs a full
-  collection at the start of every request, while the stack is shallow
-  (20-30 ms; live heap between requests 25 MiB on pike). Cells must not
-  rely on the conservative stack for liveness either way.
+  about 20 generations with five hosts). P1 ran a full collection at the
+  start of every request; with cells the live heap is several GiB and that
+  collection cost ~1.3 s wall and ~15 s CPU (parallel marking) per request.
+  Since P1b the daemon zeroes the unused part of the main thread's stack
+  (below the current frame, down to the lowest mapped address of
+  `[stack]`) and runs the full collection right after responding, while
+  idle; a request then rarely collects. Cells must not rely on the
+  conservative stack for liveness either way.
 - Also measured: `getFlake()` parses the root `flake.nix` through the raw
   work tree accessor before mounting it; every generation gets a new
   accessor, so such cache entries can never be hit again.
@@ -492,6 +496,12 @@ against a cold `nix-instantiate --readonly-mode`.
   owning file hashes + config hash + system). Reproduces the resident-repl
   result (19.5 s → 6.5 s) automatically. Acceptance: same numbers,
   identical drvPath, invalidation when an overlay file changes.
+  Done (section 12), with ports and traces rather than a structural key:
+  a structural key cannot work because the overlays and `config` of a
+  NixOS system capture values of the flake that are new after every
+  edit. 80 paired evaluations on the five hosts with identical drvPaths;
+  pike after an edit 11.5 → 4.4 s wall (cold 10.3 s CPU, daemon 4.3 s),
+  one daemon for all hosts ~9.9 GiB RSS.
 - **P2** (general call cells, ports, traces, validation): the real thing
   for packages and everything outside the module system. Expected:
   ≤ 6.5 s after a module edit, misses limited to the changed files and
@@ -507,3 +517,70 @@ on deep `config` observation chains; `__curPos` without lazy trees;
 memory growth without aggressive eviction; subtle identity bugs producing
 different drvPaths (mitigated by `--verify` on every deploy during
 development).
+
+## 12. P1b as implemented
+
+`src/libexpr/traced-cells.{hh,cc}`, `nix eval-daemon` (cells on by
+default, `--no-cells`, `--cell-file`, `--max-cells`). Cell sites are the
+file-level lambdas with formals of files whose path ends with a configured
+suffix, default `/pkgs/top-level/impure.nix` (`import nixpkgs { ... }`).
+The sections above describe the general design; this is what P1b does and
+where it departs from them.
+
+- **Ports.** Only the root argument is a port; everything the cell gets
+  from it is a child port or a call port (`ExprPort`, a GC-allocated
+  `Expr` whose canonical value is a thunk). Resolving forces the backing
+  value and records the first observation: primitives are copied,
+  attribute sets and lists become proxies whose elements are the
+  canonical values of child ports, functions become `__portCall` primop
+  applications. There is no `tPort` value type and no re-arming: a forced
+  canonical value only ever holds a stable proxy or a primitive that
+  every validation checked equal.
+- **Identity.** Child ports are keyed by the address of their backing
+  value, so aliasing in the argument is aliasing of canonical values, as
+  in a cold evaluation. `eqValues` records identity observations (pointer
+  short cut, comparison of functions) and compares function ports by
+  their current backing. Validation preserves aliasing only where it was
+  observed or where one path now leads to a different value.
+- **Keys.** Lambda and closure environment (stable: the file is cached),
+  plus the call site rendered without the store path hash. Candidates at
+  the same key are tried starting with the one that served the same call
+  ordinal at that site in the previous generation.
+- **Validation** replays the ports in creation order against the new
+  argument on the side and commits only on success. Replaying calls
+  forces the instance's own thunks, which may create ports; they are
+  checked in the same pass. An observation whose replay hits infinite
+  recursion depends on a value being computed (typically the cell's own
+  result, read by an overlay through the NixOS configuration); it is
+  deferred, its subtree is refreshed lazily from the new argument, and
+  `CellTable::checkDeferred()` checks it after the request; on failure
+  the instance is dropped and the request evaluated again
+  (`CellInvalidated`, recoverable so no thunk keeps the error).
+  Speculative forcing never caches errors in thunks
+  (`EvalState::speculative`).
+- **Ownership.** Every `Env` records the context it was allocated in
+  (`EvalMemory::currentOwner`): a cell instance, or null for ordinary
+  evaluation. Forcing a thunk runs in its environment's context; the
+  primops that create lazy applications of user functions (`map`,
+  `genList`, `mapAttrs`, `zipAttrsWith`) create thunks instead of `tApp`s
+  in a cell's context (`EvalState::mkLazyApp()`), so a remaining `tApp`
+  comes from ordinary evaluation and runs in the context of its lambda.
+  Calls of proxied functions made by ordinary evaluation (for example
+  `stdenv.hostPlatform.canExecute` from a NixOS module) go straight to the
+  backing function and are not recorded: their results never reach a
+  cell, and recording them retained every generation's module system
+  through the call arguments (+760 MiB live heap per generation on pike).
+  Resolutions are always recorded: a canonical value forced by ordinary
+  evaluation may later be read by the cell without resolution.
+- **Budget.** An instance with more than 100 000 ports makes its call
+  site untraceable (Nixpkgs' own `legacyPackages`, whose overlay replaces
+  `lib`, reaches 2.35 M ports on pike).
+- **Nesting.** An instance reached through another reused instance is
+  never rebound (`unusable`). Instances are GC objects, so dropping one
+  only unroots it.
+
+Known gaps, to be closed by P2's ownership of thunks: an instance created
+while forcing another instance's result could still be rebound in the
+same generation before its nested use is noticed; positions of proxy
+attributes in error messages may be stale; `builtins.trace` output can
+appear during replay.

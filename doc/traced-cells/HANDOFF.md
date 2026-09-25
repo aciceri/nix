@@ -9,15 +9,16 @@ numbers behind the design, the repository state and the rules.
 - Remotes: `origin` = git@github.com:aciceri/nix.git, `upstream` =
   git@github.com:NixOS/nix.git. `master` was fast-forwarded to
   `upstream/master` (`18057950c`, version 2.36.0 pre-release).
-- Branch `traced-cells` (checked out) = master + doc commits + P1. Nothing
+- Branch `traced-cells` (checked out) = master + doc commits + P1 + P1b. Nothing
   pushed. Do not push, merge or open PRs without explicit authorization
   from Andrea.
-- Done: P0 (harness, cold baseline) and P1 (`nix eval-daemon`, file cells
-  across generations), see DESIGN.md sections 7 and 11 and
-  `projects/fasteval/NOTES.md` sections "P0" and "P1" in `universe`. Next
-  is P1b (Nixpkgs instance cell) or the source root port of DESIGN.md 8.3,
-  which P2/P3 need.
-- Tests: `meson test -C build --suite flakes eval-daemon` (functional),
+- Done: P0 (harness, cold baseline), P1 (`nix eval-daemon`, file cells
+  across generations) and P1b (traced cells for `import nixpkgs`), see
+  DESIGN.md sections 7, 11 and 12 and `projects/fasteval/NOTES.md`
+  sections "P0", "P1" and "P1b" in `universe`. Next: the source root port
+  (DESIGN.md 8.3), then P2 cells for module and package applications.
+- Tests: `meson test -C build --suite flakes eval-daemon eval-daemon-cells`
+  (functional),
   `cycle.py run --daemon ...` (acceptance on `universe`, see NOTES.md).
 - Build: `nix develop`, then `meson setup build $mesonFlags` and
   `ninja -C build` (debugoptimized, ~18 min from scratch). Benchmarks use a

@@ -22,12 +22,51 @@
 #include <sys/stat.h>
 
 #include <chrono>
+#include <fstream>
 
 namespace nix {
 
 using json = nlohmann::json;
 
 namespace {
+
+#ifdef __linux__
+/**
+ * Zero the part of the main thread's stack below the current frame.
+ *
+ * Boehm scans the active stack conservatively. A deep evaluation runs over
+ * stack slots where the previous deep evaluation left pointers (padding,
+ * unwritten locals), so a collection during it would keep much of the
+ * previous request's values alive (measured: +1.5 GiB live heap per
+ * request on a NixOS workstation). Clearing the stack before each request
+ * removes them without a full collection over the (large) live heap.
+ *
+ * Returns false if the stack could not be located, for example when not
+ * called on the main thread.
+ */
+[[gnu::noinline]] bool clearUnusedStack()
+{
+    uintptr_t low = 0;
+    {
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line))
+            if (line.ends_with("[stack]")) {
+                low = std::stoull(line.substr(0, line.find('-')), nullptr, 16);
+                break;
+            }
+    }
+    volatile char marker = 0;
+    auto sp = reinterpret_cast<uintptr_t>(&marker);
+    /* Leave a margin below this frame; the loop makes no calls. */
+    auto end = sp - 4096;
+    if (!low || low >= end)
+        return false;
+    for (auto p = reinterpret_cast<volatile uintptr_t *>(low); p < reinterpret_cast<volatile uintptr_t *>(end); ++p)
+        *p = 0;
+    return true;
+}
+#endif
 
 /**
  * Evaluations of one request after reused traced cells were found invalid.
@@ -214,6 +253,17 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
 
             if (command == "quit")
                 return true;
+
+            /* Collect the request's garbage while idle, so that the next
+               request rarely needs a collection (which marks every
+               retained cell). The stack is cleared first so that the
+               request's stale pointers do not keep its values alive. */
+            if (command == "eval") {
+#ifdef __linux__
+                clearUnusedStack();
+#endif
+                getEvalState()->fullGC();
+            }
         }
     }
 
@@ -226,15 +276,13 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         auto before = state->getStatistics();
         auto cellsBefore = state->cells ? state->cells->stats : CellTable::Stats{};
 
-        /* Collect the previous generation now, while the C++ stack is
-           shallow. Boehm scans the stack conservatively, and a deep
-           evaluation runs over stack slots where the previous deep
-           evaluation left stale pointers; a collection during this
-           evaluation would therefore keep much of the previous generation
-           alive (measured: +1.5 GiB live heap per generation). The cost is
-           part of the reported CPU time. */
-        state->fullGC();
-        auto startGcTime = secondsSince(start);
+        /* The previous request's garbage was collected after it
+           responded (see `serve()`); remove any stale pointers left on the
+           stack since then. */
+#ifdef __linux__
+        clearUnusedStack();
+#endif
+        auto prepareTime = secondsSince(start);
         json response;
         unsigned int attempts = 0;
         while (true) {
@@ -275,7 +323,7 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         response["stats"] = {
             {"generation", state->getGeneration()},
             {"wallTime", secondsSince(start)},
-            {"startGcTime", startGcTime},
+            {"prepareTime", prepareTime},
             {"attempts", attempts},
             {"cpuTime", after.at("cpuTime").get<double>() - before.at("cpuTime").get<double>()},
             {"gcTime", gcTime(after) - gcTime(before)},
