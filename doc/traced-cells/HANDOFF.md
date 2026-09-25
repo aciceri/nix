@@ -29,6 +29,11 @@ numbers behind the design, the repository state and the rules.
 - Use: `projects/fasteval/fasteval.py` in `universe` (`eval|build|switch
   HOST`, starts the daemon on `$XDG_RUNTIME_DIR/fasteval.sock`); write mode
   3.5-3.9 s per pike request after the first. Switching was never run.
+  `projects/fasteval/fasteval.service`: systemd user unit with `--warm`
+  (not installed). Memory is stable over distinct edits (pike 4.5 GiB).
+- Andrea chose (2026-09-25) not to pursue module/option cells (they need a
+  stable virtual root or root-relative paths, DESIGN 8.3) and to
+  consolidate instead. Open: persistence across restarts (P4).
 - Tests: `meson test -C build --suite flakes eval-daemon eval-daemon-cells`
   (functional),
   `cycle.py run --daemon ...` (acceptance on `universe`, see NOTES.md).
