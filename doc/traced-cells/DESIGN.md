@@ -521,9 +521,13 @@ development).
 ## 12. P1b as implemented
 
 `src/libexpr/traced-cells.{hh,cc}`, `nix eval-daemon` (cells on by
-default, `--no-cells`, `--cell-file`, `--max-cells`). Cell sites are the
-file-level lambdas with formals of files whose path ends with a configured
-suffix, default `/pkgs/top-level/impure.nix` (`import nixpkgs { ... }`).
+default, `--no-cells`, `--no-flake-cells`, `--cell-file`, `--max-cells`).
+Cell sites are the file-level lambdas with formals of files whose path
+ends with a configured suffix, default `/pkgs/top-level/impure.nix`
+(`import nixpkgs { ... }`), and the `outputs` function of every
+`flake.nix` except the flake being evaluated (its `self` changes with
+every edit): the outputs of unchanged locked inputs, `legacyPackages`
+included, are reused as a whole.
 The sections above describe the general design; this is what P1b does and
 where it departs from them.
 
@@ -542,10 +546,19 @@ where it departs from them.
   short cut, comparison of functions) and compares function ports by
   their current backing. Validation preserves aliasing only where it was
   observed or where one path now leads to a different value.
+- **Identity.** A value created by *another* cell (attribute sets and
+  closures record their context: `Bindings::owner`, `Env::owner`) is not
+  proxied: the cell reads it directly and validation checks that the new
+  value is the same object. Pointer identity is always sound; it holds
+  while the other cell is reused, which is what makes flake outputs work:
+  a flake's `outputs` read their inputs' `lib`, and tracing every call of
+  it cost 3 M ports for one flake. Not for call results, which a replayed
+  call may compute afresh, nor for values of ordinary evaluation or of the
+  cell itself, which are new in every generation.
 - **Keys.** Lambda and closure environment (stable: the file is cached),
   plus the call site rendered without the store path hash. Candidates at
   the same key are tried starting with the one that served the same call
-  ordinal at that site in the previous generation.
+  ordinal (calls of that lambda at that site) in the previous generation.
 - **Validation** replays the ports in creation order against the new
   argument on the side and commits only on success. Replaying calls
   forces the instance's own thunks, which may create ports; they are
@@ -575,12 +588,14 @@ where it departs from them.
 - **Budget.** An instance with more than 100 000 ports makes its call
   site untraceable (Nixpkgs' own `legacyPackages`, whose overlay replaces
   `lib`, reaches 2.35 M ports on pike).
-- **Nesting.** An instance reached through another reused instance is
-  never rebound (`unusable`). Instances are GC objects, so dropping one
-  only unroots it.
+- **Nesting.** A cell's result may be reached through another reused
+  result before the cell is looked up in the same generation; its ports
+  then resolve against the previous binding. Validation replays those
+  reads too, so rebinding afterwards is sound for the same logical call;
+  such an instance is only offered to the call with the same ordinal.
+  Instances are GC objects, so dropping one only unroots it.
 
-Known gaps, to be closed by P2's ownership of thunks: an instance created
-while forcing another instance's result could still be rebound in the
-same generation before its nested use is noticed; positions of proxy
+Known gaps: a nested instance could be rebound to a different logical call
+that has the same ordinal and observationally equivalent arguments; positions of proxy
 attributes in error messages may be stale; `builtins.trace` output can
 appear during replay.

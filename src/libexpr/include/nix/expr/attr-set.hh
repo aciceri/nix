@@ -100,6 +100,15 @@ private:
      */
     const Bindings * baseLayer = nullptr;
 
+public:
+    /**
+     * The evaluation context in which this attribute set was allocated,
+     * like `Env::owner` (see `EvalMemory::currentOwner`).
+     */
+    void * owner = nullptr;
+
+private:
+
     /**
      * Flexible array member of attributes.
      */

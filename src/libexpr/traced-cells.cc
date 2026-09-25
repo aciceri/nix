@@ -312,14 +312,41 @@ void ExprPort::resolve(EvalState & state, Value & v)
     if (summary == Summary::None)
         observe(state, *backing);
 
-    if (summary == Summary::Primitive)
+    if (summary == Summary::Primitive || summary == Summary::Identity)
         v = *backing;
     else
         v = observed;
 }
 
+namespace {
+
+/**
+ * The object behind `v` and the context that created it, for identity
+ * summaries: attribute sets and lambdas record their context.
+ */
+std::tuple<void *, const void *, const void *> objectOf(Value & v)
+{
+    if (v.type() == nAttrs)
+        return {v.attrs()->owner, v.attrs(), nullptr};
+    if (v.isLambda())
+        return {v.lambda().env->owner, v.lambda().fun, v.lambda().env};
+    return {nullptr, nullptr, nullptr};
+}
+
+} // namespace
+
 void ExprPort::observe(EvalState & state, Value & b)
 {
+    /* Not for call results: a call may compute its result afresh, so the
+       result of replaying it is a different object even when nothing
+       changed. */
+    if (auto [owner, object, env] = objectOf(b); kind != Kind::Call && owner && owner != cell) {
+        identity[0] = object;
+        identity[1] = env;
+        summary = Summary::Identity;
+        return;
+    }
+
     switch (b.type()) {
 
     case nAttrs: {
@@ -398,7 +425,7 @@ ExprPort * CellInstance::childFor(EvalState & state, Value * backing, ExprPort *
 void CellInstance::noteUse(EvalState & state)
 {
     if (boundGen != state.getGeneration() && !validating)
-        unusable = true;
+        usedNested = true;
 }
 
 CellTable::CellTable(EvalState & state, std::vector<std::string> fileSuffixes, size_t maxInstances)
@@ -415,25 +442,36 @@ CellTable::CellTable(EvalState & state, std::vector<std::string> fileSuffixes, s
     vPortCall = allocRootValue(v);
 }
 
-void CellTable::registerFile(const SourcePath & path, Value & v)
+void CellTable::registerFile(EvalState & state, const SourcePath & path, Expr * e, Value & v)
 {
-    if (!v.isLambda() || !v.lambda().fun->getFormals())
-        return;
     auto file = path.path.abs();
-    for (auto & suffix : fileSuffixes)
-        if (file.ends_with(suffix)) {
-            v.lambda().fun->cellSite = true;
-            sites.emplace(v.lambda().fun, v.lambda().env);
-            return;
-        }
+
+    if (v.isLambda() && v.lambda().fun->getFormals())
+        for (auto & suffix : fileSuffixes)
+            if (file.ends_with(suffix)) {
+                v.lambda().fun->cellSite = true;
+                return;
+            }
+
+    if (flakeOutputs && file.ends_with("/flake.nix"))
+        if (auto attrs = dynamic_cast<ExprAttrs *>(e))
+            if (auto i = attrs->attrs->find(state.symbols.create("outputs")); i != attrs->attrs->end())
+                if (auto lambda = dynamic_cast<ExprLambda *>(i->second.e)) {
+                    lambda->cellSite = true;
+                    flakeOutputSites.insert(lambda);
+                }
 }
 
 bool CellTable::call(EvalState & state, Value & fun, Value & arg, Value & vRes, PosIdx pos)
 {
     auto & lambda = *fun.lambda().fun;
     auto * env = fun.lambda().env;
-    if (!sites.contains({&lambda, env}))
-        return false;
+
+    if (flakeOutputSites.contains(&lambda) && !excludedRoot.empty()) {
+        auto origin = state.positions[lambda.pos].origin;
+        if (auto path = std::get_if<SourcePath>(&origin); path && path->path.abs().starts_with(excludedRoot))
+            return false;
+    }
 
     try {
         state.forceAttrs(arg, lambda.pos, "while evaluating the value passed for the lambda argument");
@@ -445,15 +483,16 @@ bool CellTable::call(EvalState & state, Value & fun, Value & arg, Value & vRes, 
 
     /* Calls that fail the formals check take the normal path, which
        reports the error. */
-    auto formals = *lambda.getFormals();
-    size_t used = 0;
-    for (auto & formal : formals.formals)
-        if (arg.attrs()->get(formal.name))
-            used++;
-        else if (!formal.def)
+    if (auto formals = lambda.getFormals()) {
+        size_t used = 0;
+        for (auto & formal : formals->formals)
+            if (arg.attrs()->get(formal.name))
+                used++;
+            else if (!formal.def)
+                return false;
+        if (!formals->ellipsis && used != arg.attrs()->size())
             return false;
-    if (!formals.ellipsis && used != arg.attrs()->size())
-        return false;
+    }
 
     auto callSite = state.symbols.create(renderCallSite(state, pos));
     if (untraceable.contains({&lambda, env, callSite}))
@@ -464,7 +503,7 @@ bool CellTable::call(EvalState & state, Value & fun, Value & arg, Value & vRes, 
     for (auto * cell : instances)
         if (cell->lambda == &lambda && cell->env == env && cell->callSite == callSite && !cell->unusable)
             candidates.push_back(cell);
-    auto ordinal = callsInGeneration[callSite]++;
+    auto ordinal = callsInGeneration[{callSite, &lambda}]++;
     std::ranges::sort(candidates, [&](auto * a, auto * b) {
         if ((a->ordinal == ordinal) != (b->ordinal == ordinal))
             return a->ordinal == ordinal;
@@ -472,6 +511,8 @@ bool CellTable::call(EvalState & state, Value & fun, Value & arg, Value & vRes, 
     });
 
     for (auto * cell : candidates) {
+        if (cell->usedNested && cell->ordinal != ordinal)
+            continue;
         if (cell->boundGen == gen) {
             /* Already bound in this generation; only the same argument
                may share it. */
@@ -496,8 +537,9 @@ bool CellTable::call(EvalState & state, Value & fun, Value & arg, Value & vRes, 
         if (valid) {
             printMsg(
                 lvlTalkative,
-                "traced cell %s #%d: reused instance #%d (%d ports)",
+                "traced cell %s (%s) #%d: reused instance #%d (%d ports)",
                 state.symbols[callSite],
+                state.positions[lambda.pos],
                 ordinal,
                 cell->ordinal,
                 cell->ports.size());
@@ -518,7 +560,12 @@ bool CellTable::call(EvalState & state, Value & fun, Value & arg, Value & vRes, 
     }
 
     stats.misses++;
-    printMsg(lvlTalkative, "traced cell %s #%d: new instance", state.symbols[callSite], ordinal);
+    printMsg(
+        lvlTalkative,
+        "traced cell %s (%s) #%d: new instance",
+        state.symbols[callSite],
+        state.positions[lambda.pos],
+        ordinal);
     return create(state, fun, arg, vRes, callSite, ordinal);
 }
 
@@ -544,17 +591,18 @@ bool CellTable::create(EvalState & state, Value & fun, Value & arg, Value & vRes
     cell->root->resolve(state, vArgs);
 
     /* Bind the formals like `EvalState::callFunction`, but to ports. */
-    auto formals = *lambda.getFormals();
-    Env & env2 = state.mem.allocEnv((lambda.arg ? 1 : 0) + formals.formals.size());
+    auto formals = lambda.getFormals();
+    Env & env2 = state.mem.allocEnv((lambda.arg ? 1 : 0) + (formals ? formals->formals.size() : 0));
     env2.owner = cell;
     env2.up = fun.lambda().env;
     Displacement displ = 0;
     if (lambda.arg)
         env2.values[displ++] = cell->root->canonical;
-    for (auto & formal : formals.formals) {
-        auto j = vArgs.attrs()->get(formal.name);
-        env2.values[displ++] = j ? j->value : formal.def->maybeThunk(state, env2);
-    }
+    if (formals)
+        for (auto & formal : formals->formals) {
+            auto j = vArgs.attrs()->get(formal.name);
+            env2.values[displ++] = j ? j->value : formal.def->maybeThunk(state, env2);
+        }
 
     /* Registered before the body runs, so that the instance outlives any
        value that refers to its ports even if the body fails. */
@@ -732,6 +780,15 @@ bool CellTable::validate(EvalState & state, CellInstance & cell, Value * rootBac
                 return false;
             }
             break;
+
+        case ExprPort::Summary::Identity: {
+            auto [owner, object, env] = objectOf(b);
+            if (object != port.identity[0] || env != port.identity[1]) {
+                why = "a value of another cell is a different object";
+                return false;
+            }
+            break;
+        }
 
         case ExprPort::Summary::None:
         case ExprPort::Summary::Failed:

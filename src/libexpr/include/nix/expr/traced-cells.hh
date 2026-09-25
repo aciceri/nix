@@ -8,6 +8,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <nlohmann/json_fwd.hpp>
 
+#include <map>
 #include <set>
 
 namespace nix {
@@ -35,7 +36,7 @@ struct CellInstance;
 struct ExprPort : Expr, gc
 {
     enum class Kind : uint8_t { Root, Child, Call };
-    enum class Summary : uint8_t { None, Primitive, Attrs, List, Function, Failed };
+    enum class Summary : uint8_t { None, Primitive, Attrs, List, Function, Identity, Failed };
 
     CellInstance * cell;
     Kind kind;
@@ -77,6 +78,17 @@ struct ExprPort : Expr, gc
      * `Function`: the proxy handed to the cell.
      */
     Value observed;
+
+    /**
+     * `Summary::Identity`: the value is an attribute set or a function
+     * created by another cell; the cell reads it directly, and validation
+     * only checks that the new value is the same object (the `Bindings`,
+     * or the lambda and its environment). Pointer identity is always
+     * sound; it is used where it will hold across requests: for values of
+     * another cell's result, which are the same objects while that cell is
+     * reused.
+     */
+    const void * identity[2] = {nullptr, nullptr};
 
     /**
      * Child ports in proxy order (attribute sets: sorted by name; lists:
@@ -193,20 +205,27 @@ struct CellInstance : gc
     size_t portsAtStart = 0;
 
     /**
-     * Position of the call that bound this instance among the calls at
-     * the same call site in its generation. Evaluation is deterministic,
+     * Position of the call that bound this instance among the calls of
+     * the same function at the same call site in its generation. Evaluation is deterministic,
      * so the call with the same ordinal in the next generation is usually
      * the one this instance should serve; it is tried first.
      */
     size_t ordinal = 0;
 
     /**
-     * Set when the result was reached in a generation in which this
-     * instance was not bound, i.e. through the result of another reused
-     * cell. Such an instance must keep its binding and is never offered for
-     * reuse again. Also set when the evaluation of the body failed.
+     * Set while the body is evaluated and when that fails.
      */
     bool unusable = false;
+
+    /**
+     * The result was reached in a generation before this instance was
+     * bound in it, i.e. through the result of another reused cell. Its
+     * ports were then resolved against the previous binding; validation
+     * replays those reads too, so rebinding is sound, but only for the
+     * same logical call: such an instance is only offered to the call
+     * with the same ordinal at its site.
+     */
+    bool usedNested = false;
 
     /**
      * True while this instance is being validated: replaying calls forces
@@ -241,10 +260,24 @@ struct CellTable
     CellTable(EvalState & state, std::vector<std::string> fileSuffixes, size_t maxInstances);
 
     /**
-     * Called for every newly evaluated file: registers its value as a cell
-     * site if the path matches and the value is a lambda with formals.
+     * Also make the `outputs` function of every `flake.nix` a cell site,
+     * except for the flake being evaluated (`excludedRoot`): the outputs
+     * of unchanged locked inputs are then reused across requests.
      */
-    void registerFile(const SourcePath & path, Value & v);
+    bool flakeOutputs = true;
+
+    /**
+     * Directory of the flake being evaluated by the current request; its
+     * `outputs` are not a cell (its `self` changes with every edit).
+     */
+    std::string excludedRoot;
+
+    /**
+     * Called for every newly evaluated file with its parsed expression
+     * and value: registers cell sites (the file-level lambda with formals
+     * of files whose path matches, the `outputs` lambda of `flake.nix`).
+     */
+    void registerFile(EvalState & state, const SourcePath & path, Expr * e, Value & v);
 
     /**
      * Apply the cell site `fun` to `arg`, reusing an instance if one
@@ -311,7 +344,7 @@ struct CellTable
     nlohmann::json instancesJson(const EvalState & state) const;
 
 private:
-    boost::unordered_flat_set<std::pair<ExprLambda *, Env *>> sites;
+    boost::unordered_flat_set<ExprLambda *> flakeOutputSites;
 
     /**
      * Call sites whose instances exceeded `maxPorts`: an argument that the
@@ -322,9 +355,9 @@ private:
     std::set<std::tuple<ExprLambda *, Env *, Symbol>> untraceable;
 
     /**
-     * Calls per call site in the current generation.
+     * Calls per call site and function in the current generation.
      */
-    boost::unordered_flat_map<Symbol, size_t, std::hash<Symbol>> callsInGeneration;
+    std::map<std::pair<Symbol, ExprLambda *>, size_t> callsInGeneration;
 
     /**
      * Replay the observations of `cell` against `rootBacking`. Eager

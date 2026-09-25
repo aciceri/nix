@@ -1151,7 +1151,7 @@ struct ExprParseFile : Expr, gc
             state.eval(e, v);
 
             if (state.cells)
-                state.cells->registerFile(path, v);
+                state.cells->registerFile(state, path, e, v);
         } catch (Error & e) {
             state.addErrorTrace(e, "while evaluating the file '%s':", path.to_string());
             throw;

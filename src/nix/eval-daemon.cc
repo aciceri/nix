@@ -98,8 +98,9 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
     std::optional<std::filesystem::path> socketPath;
     bool verify = false;
     bool cells = true;
+    bool flakeCells = true;
     std::vector<std::string> cellFiles;
-    size_t maxCells = 16;
+    size_t maxCells = 128;
 
     CmdEvalDaemon()
     {
@@ -121,6 +122,11 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
             .handler = {&cells, false},
         });
         addFlag({
+            .longName = "no-flake-cells",
+            .description = "Do not reuse the outputs of the flake's inputs as cells.",
+            .handler = {&flakeCells, false},
+        });
+        addFlag({
             .longName = "cell-file",
             .description =
                 "Make the file-level function of files whose path ends with *suffix* a cell site. "
@@ -130,7 +136,7 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         });
         addFlag({
             .longName = "max-cells",
-            .description = "Keep at most *n* cell instances (default: 16).",
+            .description = "Keep at most *n* cell instances (default: 128).",
             .labels = {"n"},
             .handler = {[&](std::string s) { maxCells = string2IntWithUnitPrefix<size_t>(s); }},
         });
@@ -168,9 +174,12 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         if (verify && (!lockFlags.inputOverrides.empty() || !lockFlags.inputUpdates.empty()))
             throw UsageError("'--verify' cannot be combined with flags that change the lock file");
 
-        if (cells)
-            getEvalState()->enableCells(
+        if (cells) {
+            auto state = getEvalState();
+            state->enableCells(
                 cellFiles.empty() ? std::vector<std::string>{"/pkgs/top-level/impure.nix"} : cellFiles, maxCells);
+            state->cells->flakeOutputs = flakeCells;
+        }
 
         if (!socketPath) {
             serve(getStandardInput(), getStandardOutput());
@@ -370,8 +379,11 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         auto [flakeRef, fragment] = parseFlakeRefWithFragment(installable, std::filesystem::current_path());
         auto attrPath = fragment.starts_with(".") ? fragment.substr(1) : fragment;
 
+        auto locked = flake::lockFlake(flakeSettings, state, flakeRef, lockFlags);
+        if (state.cells)
+            state.cells->excludedRoot = locked.flake.path.parent().path.abs() + "/";
         auto vFlake = state.allocValue();
-        flake::callFlake(state, flake::lockFlake(flakeSettings, state, flakeRef, lockFlags), *vFlake);
+        flake::callFlake(state, locked, *vFlake);
 
         auto [v, pos] = findAlongAttrPath(state, attrPath, *getAutoArgs(state), *vFlake);
         state.forceValue(*v, pos);
