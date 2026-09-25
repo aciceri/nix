@@ -9,15 +9,17 @@ numbers behind the design, the repository state and the rules.
 - Remotes: `origin` = git@github.com:aciceri/nix.git, `upstream` =
   git@github.com:NixOS/nix.git. `master` was fast-forwarded to
   `upstream/master` (`18057950c`, version 2.36.0 pre-release).
-- Branch `traced-cells` (checked out) = master + one commit
-  `eea1caed8 doc: design for traced cells`. Nothing pushed. Do not push,
-  merge or open PRs without explicit authorization from Andrea.
-- Nothing is implemented. The task so far was measurement and design. Next
-  steps are the phases in DESIGN.md section 11, starting with P0/P1, and
-  only when Andrea asks to implement.
-- Build: standard upstream meson/nix build (`nix develop`, `meson setup
-  build`, `ninja -C build`), see `doc/manual/source/development/building.md`.
-  Not yet done on this branch.
+- Branch `traced-cells` (checked out) = master + doc commits (design,
+  handoff, design decisions). Nothing pushed. Do not push, merge or open
+  PRs without explicit authorization from Andrea.
+- Evaluator not implemented yet. P0 (harness, cold baseline) is done: see
+  DESIGN.md section 11 and `projects/fasteval/NOTES.md` section "P0" in
+  `universe`. Next is P1.
+- Build: `nix develop`, then `meson setup build $mesonFlags` and
+  `ninja -C build` (debugoptimized, ~18 min from scratch). Benchmarks use a
+  second tree: `meson setup build-release $mesonFlags --buildtype=release
+  -Db_lto=true` (`/build-release` is excluded in `.git/info/exclude`).
+  The built binary uses the system store and `/etc/nix/nix.conf`.
 
 ## Why this exists (measurements on Andrea's workstation `pike`)
 
@@ -107,14 +109,15 @@ Experiments that support the design (all files under
 
 Cells = applications of file-level lambdas with formals to attrsets
 (`callPackage`, `import nixpkgs {…}`, modules, `evalModules`), plus file
-cells keyed by content hash and derivation cells. Small arguments go into
-the key; large/lazy/cyclic ones (`pkgs`, `config`, `lib`, `inputs`) are
-ports, compared by the trace of what the cell observed through them. A
-cell is reused in a new generation if replaying its trace against the new
-ports and inputs gives the same summaries (verifying traces, bottom-up,
-early cutoff). Soundness for unforced thunks inside a reused result comes
-from ports being indirections (`tPort` value kind resolved through a
-per-generation table), so old closures read new data. Resident process
+cells keyed by content hash and root-relative path, and derivation cells.
+Small arguments go into the key; large/lazy/cyclic ones (`pkgs`, `config`,
+`lib`, `inputs`) are ports, compared by the trace of what the cell observed
+through them. A cell is reused in a new generation if replaying its trace
+against the new ports and inputs gives the same summaries (verifying
+traces, bottom-up, early cutoff). Soundness for unforced thunks inside a
+reused result comes from ports and values derived from them being
+indirections (`tPort` value kind resolved through a per-generation table,
+DESIGN.md 5.4), so old closures read new data. Resident process
 (`nix eval-daemon`, built from `repl.cc` pieces), `--verify` mode compares
 with a cold evaluation. Persistence later: keys/traces are pointer-free;
 results stored as WHNF with lazy-fallback children.

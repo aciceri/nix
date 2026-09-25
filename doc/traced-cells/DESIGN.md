@@ -110,35 +110,47 @@ ports by default.
 
 | Kind | Created at | Key | Result |
 |---|---|---|---|
-| File | `EvalState::evalFile` (`src/libexpr/eval.cc:1160`) | content hash of the file (plus `mustBeTrivial`) | the file's value (usually a lambda) |
+| File | `EvalState::evalFile` (`src/libexpr/eval.cc:1160`) | content hash of the file + its path relative to the root of its input (plus `mustBeTrivial`) | the file's value (usually a lambda) |
 | Call | `EvalState::callFunction`, lambda branch (`src/libexpr/eval.cc:1608`), only for lambdas **with formals** whose argument is an attrset | lambda identity + argument descriptor | WHNF of the body |
 | Derivation | `prim_derivationStrict` (`src/libexpr/primops.cc:1425`) | hash of the fully forced, context-annotated attribute set | `{ drvPath, <outputs> }` |
 | Option (phase 3) | inside `lib.modules` merge, see 5.5 | option declaration identity + identities of the definition thunks | merged option value |
 
 File cells replace `fileEvalCache`'s keying by `SourcePath` with keying by
-content hash; the `SourcePath → hash` map is the per-generation
-fingerprint table. This alone makes a re-copied flake source (new
-`/nix/store/…-source` path after each edit) hit the cache for every
-unchanged file.
+content hash and root-relative path; the `SourcePath → key` map is the
+per-generation fingerprint table. This alone makes a re-copied flake source
+(new `/nix/store/…-source` path after each edit) hit the cache for every
+unchanged file. The relative path is part of the key because a file's
+value depends on its location: path literals (`./foo.nix`), `import` and
+`__curPos` resolve against it, so two identical `default.nix` files in
+different directories must not share a cell. The input root is the flake
+source tree or the locked input it belongs to; files outside any input
+(absolute paths, `NIX_PATH` lookups) are keyed by absolute path.
 
 Derivation cells are cheap insurance: when a call cell misses (for example
 a package whose file changed only in a comment), `mkDerivation` still runs
 but `derivationStrict` does not rewrite the `.drv`. They are keyed by the
-same content that `hashDerivationModulo` sees.
+same content that `hashDerivationModulo` sees. Computing the key already
+forces the whole attribute set, so they save only `hashDerivationModulo`
+and the store write (~3 s wall on `pike`, 8.6), not evaluation.
 
 ### 5.2 Lambda identity
 
-`(file cell id of the file that contains the lambda, byte offset of the
+`(file cell key of the file that contains the lambda, byte offset of the
 lambda in the file)`. Both are stable across store copies. The offset comes
 from `PosIdx`/`PosTable` (`src/libexpr/include/nix/expr/pos-table.hh`)
 whose origin is the `SourcePath` of the parse.
 
 Lambdas created by evaluating an expression inside a cell also carry the
-identity of the **owning cell** (the cell whose body created the closure).
-This is how functions observed through ports are compared: two function
-values are "the same" if they have the same lambda identity and the same
-owning cell id. Conservative (a re-evaluated but identical cell yields a
-new owning id only if its key changed) and cheap.
+id of the **owning cell instance** (the cell whose body created the
+closure). This is how functions observed through ports are compared: two
+function values are "the same" if they have the same lambda identity and
+the same owning cell instance. The instance id, not the key, is required:
+several instances can share a key with different traces (5.3), and their
+closures capture different port contents. An instance keeps its id for as
+long as it is reused; a re-evaluation creates a new instance and therefore
+new function identities. Lambdas created outside any cell belong to a
+per-generation root instance, so they never match across generations
+(conservative).
 
 ### 5.3 Argument descriptor
 
@@ -172,12 +184,32 @@ as `attrNames`, `functionArgs`, `typeOf`, `isAttrs`, comparison, `toString`,
 observation before proceeding. Resolution yields the backing value for the
 current generation; the port itself is never overwritten.
 
-Port-derived values: an attribute selected from a port is not itself a
-port, but it is tainted: a side table `Value * → (port id, attribute path)`
-(allocated with `traceable_allocator`) lets later selections extend the
-path, so `pkgs.stdenv.hostPlatform.isLinux` is one observation
-`(pkgs, [stdenv, hostPlatform, isLinux]) = true`. The taint stops at cell
-results (they have an identity) and at primitives (they are summarised).
+Port-derived values are ports too. Selecting a non-primitive attribute
+from a port yields a **derived port**, a `tPort` whose id names `(parent
+port id, attribute name or list index)`, instead of the backing value
+itself. The per-generation table resolves derived ports lazily (parent
+resolved first, then one selection) and memoises the result for the
+generation. So `let cfg = config.services.foo; in ... cfg.enable ...`
+stores a derived port in `cfg`; when a thunk of a reused result forces
+`cfg.enable` in a later generation it reads the new `config`, and the
+read is recorded as the observation `(config, [services, foo, enable])`.
+Without this, `cfg` would hold the old generation's attrset, later reads
+through it would neither see new data nor be traced, and reuse of lazy
+results would be unsound.
+
+Selection results that are *not* wrapped: primitives (returned as they
+are, after being observed), cell results (identity observed, 6.2) and
+lambdas with an owning cell instance (identity observed). Everything else
+(attrsets and lists that are not cell results, primop applications,
+lambdas without an owner) is a derived port.
+
+Child extraction: operations that copy children out of a port-backed
+container without forcing them (`//`, `attrValues`, `mapAttrs`,
+`listToAttrs` over a port list, `++`, `map`, `elemAt`, `head`, `concatLists`,
+`genericClosure`, `with` variable lookup) wrap each copied child as a
+derived port `(container port, name or index)`, so that the copies stay
+indirections. The cost is one small allocation per copied child, paid only
+for containers reached through a port.
 
 Passing a port-derived value into another cell puts a "port path"
 reference into that cell's descriptor. The inner cell's own trace records
@@ -351,9 +383,10 @@ that reads it miss on every generation, which is correct.
 ### 8.9 GC and identity
 
 Cell results are kept alive by `RootValue`; everything else is ordinary
-Boehm-managed memory. `Value *` addresses are used as identities only
-within one generation (taint table); cross-generation identities are cell
-ids and lambda identities, never pointers.
+Boehm-managed memory. `Value *` addresses are never identities: port and
+derived-port ids index the per-generation resolution table (whose entries
+are `RootValue`s or `traceable_allocator` storage), and cross-generation
+identities are cell instance ids and lambda identities.
 
 ### 8.10 Threads
 
@@ -399,9 +432,16 @@ against a cold `nix-instantiate --readonly-mode`.
 - **P0** (harness): `--verify` comparator and a benchmark script that
   edits a module, requests an evaluation, restores the file, over the
   `universe` hosts. Acceptance: reproducible cold numbers.
-- **P1** (resident + file cells): daemon skeleton, content-hash keyed file
-  cells, generations, fingerprinting. Expected gain: parsing only (~5%).
-  Acceptance: identical drvPath over 20 edit/restore cycles; RSS stable.
+  Done as `projects/fasteval/_experiments/cycle.py` in `universe`: edits
+  are patch files applied to a scratch clone, evaluators are compared in
+  paired ABBA order, and every result is checked against a cold reference
+  drvPath cached per git tree hash (`refs.tsv`). That check is the
+  comparator until the daemon exists; `nix eval-daemon --verify` (a cold
+  evaluation in a child process) comes with P1.
+- **P1** (resident + file cells): daemon skeleton, file cells keyed by
+  content hash and root-relative path, generations, fingerprinting.
+  Expected gain: parsing only (~5%). Acceptance: identical drvPath over 20
+  edit/restore cycles; RSS stable.
 - **P1b** (nixpkgs instance cell, no traces): a special case of a call cell
   for the top-level `import nixpkgs { ... }` keyed structurally (overlay
   owning file hashes + config hash + system). Reproduces the resident-repl
@@ -416,7 +456,8 @@ against a cold `nix-instantiate --readonly-mode`.
 - **P4** (persistence): cold start from SQLite ≤ 1.5x warm.
 
 Risks, in order: trace size on cells that iterate large ports
-(`lib.mapAttrs` over `pkgs`); validation cost approaching evaluation cost
+(`lib.mapAttrs` over `pkgs`); allocation cost of derived ports on child
+extraction (5.4); validation cost approaching evaluation cost
 on deep `config` observation chains; `__curPos` without lazy trees;
 memory growth without aggressive eviction; subtle identity bugs producing
 different drvPaths (mitigated by `--verify` on every deploy during
