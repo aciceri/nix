@@ -9,14 +9,23 @@ numbers behind the design, the repository state and the rules.
 - Remotes: `origin` = git@github.com:aciceri/nix.git, `upstream` =
   git@github.com:NixOS/nix.git. `master` was fast-forwarded to
   `upstream/master` (`18057950c`, version 2.36.0 pre-release).
-- Branch `traced-cells` (checked out) = master + doc commits + P1 + P1b. Nothing
-  pushed. Do not push, merge or open PRs without explicit authorization
-  from Andrea.
+- Branch `traced-cells` (checked out) = master + doc commits + P1 + P1b +
+  flake-output cells. Nothing pushed. Do not push, merge or open PRs
+  without explicit authorization from Andrea.
 - Done: P0 (harness, cold baseline), P1 (`nix eval-daemon`, file cells
-  across generations) and P1b (traced cells for `import nixpkgs`), see
+  across generations), P1b (traced cells for `import nixpkgs`) and cells
+  for the outputs of locked flake inputs with identity summaries, see
   DESIGN.md sections 7, 11 and 12 and `projects/fasteval/NOTES.md`
-  sections "P0", "P1" and "P1b" in `universe`. Next: the source root port
-  (DESIGN.md 8.3), then P2 cells for module and package applications.
+  sections "P0", "P1", "P1b" and "Flake outputs as cells" in `universe`.
+  Pike after an edit: 3.1-3.4 s wall (cold 11.5-11.8 s); all five hosts
+  2.6-4.8 s; every drvPath identical to cold evaluation.
+- Next (not started): what remains is the module system (`lib/modules.nix`
+  94% inclusive of a warm pike request, no single hot spot), NixOS-side
+  derivations, the options documentation (15%), niri settings (17%). The
+  path is DESIGN.md 8.3 (source root port, so that files of the edited
+  flake keep their identity), then cells for module function applications
+  (stable definition objects), then option merge cells (P3), then
+  persistence (P4).
 - Tests: `meson test -C build --suite flakes eval-daemon eval-daemon-cells`
   (functional),
   `cycle.py run --daemon ...` (acceptance on `universe`, see NOTES.md).

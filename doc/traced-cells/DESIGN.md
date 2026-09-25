@@ -501,7 +501,9 @@ against a cold `nix-instantiate --readonly-mode`.
   NixOS system capture values of the flake that are new after every
   edit. 80 paired evaluations on the five hosts with identical drvPaths;
   pike after an edit 11.5 → 4.4 s wall (cold 10.3 s CPU, daemon 4.3 s),
-  one daemon for all hosts ~9.9 GiB RSS.
+  one daemon for all hosts ~9.9 GiB RSS. With the outputs of locked
+  inputs as cells and identity summaries (section 12): pike 3.1-3.4 s
+  wall after an edit, all five hosts 2.6-4.8 s.
 - **P2** (general call cells, ports, traces, validation): the real thing
   for packages and everything outside the module system. Expected:
   ≤ 6.5 s after a module edit, misses limited to the changed files and
