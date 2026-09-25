@@ -1247,6 +1247,15 @@ size_t EvalState::fileEvalCacheSize() const
     return fileEvalCache->size();
 }
 
+void EvalState::dropFileCacheUnder(std::string_view dir)
+{
+    auto under = [&](const SourcePath & path) {
+        return &*path.accessor == &*rootFS && path.path.abs().starts_with(dir);
+    };
+    fileEvalCache->erase_if([&](auto & entry) { return under(entry.first); });
+    importResolutionCache->erase_if([&](auto & entry) { return under(entry.first) || under(entry.second); });
+}
+
 void EvalState::eval(Expr * e, Value & v)
 {
     e->eval(*this, baseEnv, v);

@@ -16,6 +16,14 @@ R""(
   The second request reuses every file of the flake's locked inputs (for
   example Nixpkgs) that the first request parsed and evaluated.
 
+* Start a daemon that evaluates a configuration once before serving
+  requests, so that the first request is already fast:
+
+  ```console
+  # nix eval-daemon --socket /tmp/eval.sock \
+      --warm .#nixosConfigurations.machine.config.system.build.toplevel
+  ```
+
 * Serve requests on a Unix domain socket:
 
   ```console

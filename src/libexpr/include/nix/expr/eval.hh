@@ -729,6 +729,12 @@ public:
     size_t fileEvalCacheSize() const;
 
     /**
+     * Drop the evaluated files whose path is under `dir` (with a trailing
+     * slash), for example an earlier copy of a flake being edited.
+     */
+    void dropFileCacheUnder(std::string_view dir);
+
+    /**
      * Traced cells (doc/traced-cells/DESIGN.md), only in a long-lived
      * `EvalState` that calls `startGeneration()`. Null when disabled.
      */

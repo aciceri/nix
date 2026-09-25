@@ -2,6 +2,7 @@
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-gc.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/attr-path.hh"
@@ -22,6 +23,7 @@
 #include <sys/stat.h>
 
 #include <chrono>
+#include <deque>
 #include <fstream>
 
 namespace nix {
@@ -101,6 +103,7 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
     bool flakeCells = true;
     std::vector<std::string> cellFiles;
     size_t maxCells = 128;
+    std::vector<std::string> warm;
 
     CmdEvalDaemon()
     {
@@ -115,6 +118,13 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
             .description = "After every `eval` request, evaluate the same installable cold in a child process "
                            "and report whether the results are identical.",
             .handler = {&verify, true},
+        });
+        addFlag({
+            .longName = "warm",
+            .description = "Evaluate *installable* when the daemon starts, before serving requests, so that the "
+                           "first request finds its cells. Can be given multiple times.",
+            .labels = {"installable"},
+            .handler = {[&](std::string s) { warm.push_back(s); }},
         });
         addFlag({
             .longName = "no-cells",
@@ -179,6 +189,13 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
             state->enableCells(
                 cellFiles.empty() ? std::vector<std::string>{"/pkgs/top-level/impure.nix"} : cellFiles, maxCells);
             state->cells->flakeOutputs = flakeCells;
+        }
+
+        for (auto & installable : warm) {
+            auto response = handleEval(installable);
+            if (!response["ok"].get<bool>())
+                printError("warming up with '%s' failed: %s", installable, response["error"].get<std::string>());
+            collectIdle();
         }
 
         if (!socketPath) {
@@ -263,16 +280,8 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
             if (command == "quit")
                 return true;
 
-            /* Collect the request's garbage while idle, so that the next
-               request rarely needs a collection (which marks every
-               retained cell). The stack is cleared first so that the
-               request's stale pointers do not keep its values alive. */
-            if (command == "eval") {
-#ifdef __linux__
-                clearUnusedStack();
-#endif
-                getEvalState()->fullGC();
-            }
+            if (command == "eval")
+                collectIdle();
         }
     }
 
@@ -400,6 +409,45 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
     }
 
     /**
+     * Collect the request's garbage while idle, so that the next request
+     * rarely needs a collection (which marks every retained cell). The
+     * stack is cleared first so that the request's stale pointers do not
+     * keep its values alive; free heap blocks are returned to the
+     * operating system if Boehm was built to do that.
+     */
+    void collectIdle()
+    {
+#ifdef __linux__
+        clearUnusedStack();
+#endif
+#if NIX_USE_BOEHMGC
+        GC_gcollect_and_unmap();
+#else
+        getEvalState()->fullGC();
+#endif
+    }
+
+    /**
+     * Store paths of the most recent copies of the evaluated flakes. Every
+     * edit gives a flake a new store path, and its files are evaluated
+     * again under it; files under older copies are dropped, except for a
+     * few recent ones (an edit is often undone).
+     */
+    std::deque<std::string> recentRoots;
+    static constexpr size_t maxRecentRoots = 8;
+
+    void rememberRoot(EvalState & state, const std::string & root)
+    {
+        if (auto i = std::ranges::find(recentRoots, root); i != recentRoots.end())
+            recentRoots.erase(i);
+        recentRoots.push_front(root);
+        while (recentRoots.size() > maxRecentRoots) {
+            state.dropFileCacheUnder(recentRoots.back());
+            recentRoots.pop_back();
+        }
+    }
+
+    /**
      * Evaluate `<flakeref>#<attrpath>`. The attribute path is always
      * absolute (no `packages.<system>` probing); a leading `.` is accepted
      * for symmetry with other commands.
@@ -410,8 +458,10 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         auto attrPath = fragment.starts_with(".") ? fragment.substr(1) : fragment;
 
         auto locked = flake::lockFlake(flakeSettings, state, flakeRef, lockFlags);
+        auto root = locked.flake.path.parent().path.abs() + "/";
         if (state.cells)
-            state.cells->excludedRoot = locked.flake.path.parent().path.abs() + "/";
+            state.cells->excludedRoot = root;
+        rememberRoot(state, root);
         auto vFlake = state.allocValue();
         flake::callFlake(state, locked, *vFlake);
 
