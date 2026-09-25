@@ -9,12 +9,16 @@ numbers behind the design, the repository state and the rules.
 - Remotes: `origin` = git@github.com:aciceri/nix.git, `upstream` =
   git@github.com:NixOS/nix.git. `master` was fast-forwarded to
   `upstream/master` (`18057950c`, version 2.36.0 pre-release).
-- Branch `traced-cells` (checked out) = master + doc commits (design,
-  handoff, design decisions). Nothing pushed. Do not push, merge or open
-  PRs without explicit authorization from Andrea.
-- Evaluator not implemented yet. P0 (harness, cold baseline) is done: see
-  DESIGN.md section 11 and `projects/fasteval/NOTES.md` section "P0" in
-  `universe`. Next is P1.
+- Branch `traced-cells` (checked out) = master + doc commits + P1. Nothing
+  pushed. Do not push, merge or open PRs without explicit authorization
+  from Andrea.
+- Done: P0 (harness, cold baseline) and P1 (`nix eval-daemon`, file cells
+  across generations), see DESIGN.md sections 7 and 11 and
+  `projects/fasteval/NOTES.md` sections "P0" and "P1" in `universe`. Next
+  is P1b (Nixpkgs instance cell) or the source root port of DESIGN.md 8.3,
+  which P2/P3 need.
+- Tests: `meson test -C build --suite flakes eval-daemon` (functional),
+  `cycle.py run --daemon ...` (acceptance on `universe`, see NOTES.md).
 - Build: `nix develop`, then `meson setup build $mesonFlags` and
   `ninja -C build` (debugoptimized, ~18 min from scratch). Benchmarks use a
   second tree: `meson setup build-release $mesonFlags --buildtype=release
@@ -131,7 +135,7 @@ Hook points in this tree: `EvalState::callFunction` lambda branch
 the universe flake, so lazy-trees or relative rendering is needed);
 `prim_derivationStrict` `src/libexpr/primops.cc:1425`; `Value` layout
 `src/libexpr/include/nix/expr/value.hh:633-760` (a `pdSingleDWord` slot is
-free for `tPort`); `RootValue` `src/libexpr/include/nix/expr/root-value.hh`
+free for `tPort`); `RootValue` `src/libexpr/include/nix/expr/value.hh`, `allocRootValue`
 (side tables holding `Value *` must use `RootValue` or
 `traceable_allocator`); `PrimOp` struct in `eval.hh` (add `readsInput`);
 `NixRepl::processLine`/`loadFlake` `src/libcmd/repl.cc:352,94`.

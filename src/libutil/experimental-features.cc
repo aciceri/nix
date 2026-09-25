@@ -27,7 +27,7 @@ void MissingExperimentalFeature::anchor() {}
  * feature, we either have no issue at all if few features are not added
  * at the end of the list, or a proper merge conflict if they are.
  */
-constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BLAKE3Hashes);
+constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::EvalDaemon);
 
 constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails = {{
     {
@@ -280,6 +280,14 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
             Enables support for BLAKE3 hashes.
         )",
         .trackingUrl = "https://github.com/NixOS/nix/milestone/60",
+    },
+    {
+        .tag = Xp::EvalDaemon,
+        .name = "eval-daemon",
+        .description = R"(
+            Enable the [`nix eval-daemon`](@docroot@/command-ref/new-cli/nix3-eval-daemon.md)
+            command, a resident evaluator that reuses evaluated files across requests.
+        )",
     },
 }};
 

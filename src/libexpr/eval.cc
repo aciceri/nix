@@ -1203,6 +1203,32 @@ void EvalState::resetFileCache()
     rootFS->invalidateCache();
 }
 
+void EvalState::startGeneration()
+{
+    inputCache->clear();
+    lookupPathResolved->clear();
+    rootFS->invalidateCache();
+
+    /* Clearing `inputCache` means that inputs get new accessors from now
+       on, so entries keyed by any accessor other than the long-lived ones
+       can never be hit again (for example `flake.nix` parsed from the Git
+       work tree before mounting, see `getFlake()`). */
+    auto isLongLived = [&](const SourcePath & path) {
+        auto * accessor = &*path.accessor;
+        return accessor == &*rootFS || accessor == &*corepkgsFS || accessor == &*internalFS;
+    };
+    fileEvalCache->erase_if([&](auto & entry) { return !isLongLived(entry.first); });
+    importResolutionCache->erase_if(
+        [&](auto & entry) { return !isLongLived(entry.first) || !isLongLived(entry.second); });
+
+    generation++;
+}
+
+size_t EvalState::fileEvalCacheSize() const
+{
+    return fileEvalCache->size();
+}
+
 void EvalState::eval(Expr * e, Value & v)
 {
     e->eval(*this, baseEnv, v);
@@ -3077,7 +3103,7 @@ void EvalState::maybePrintStats()
     }
 }
 
-void EvalState::printStatistics()
+json EvalState::getStatistics()
 {
     std::chrono::microseconds cpuTimeDuration = getCpuUserTime();
     float cpuTime = std::chrono::duration_cast<std::chrono::duration<float>>(cpuTimeDuration).count();
@@ -3090,8 +3116,8 @@ void EvalState::printStatistics()
     uint64_t bAttrsets = memstats.nrAttrsets * sizeof(Bindings) + memstats.nrAttrsInAttrsets * sizeof(Attr);
 
 #if NIX_USE_BOEHMGC
-    GC_word heapSize, totalBytes;
-    GC_get_heap_usage_safe(&heapSize, 0, 0, 0, &totalBytes);
+    GC_word heapSize, freeBytes, unmappedBytes, totalBytes;
+    GC_get_heap_usage_safe(&heapSize, &freeBytes, &unmappedBytes, 0, &totalBytes);
     double gcFullOnlyTime = ({
         auto ms = GC_get_full_gc_total_time();
         ms * 0.001;
@@ -3099,10 +3125,6 @@ void EvalState::printStatistics()
     auto gcCycles = getGCCycles();
 #endif
 
-    auto outPath = getEnv("NIX_SHOW_STATS_PATH").value_or("-");
-    std::fstream fs;
-    if (outPath != "-")
-        fs.open(outPath, std::fstream::out);
     json topObj = json::object();
     topObj["cpuTime"] = cpuTime;
     topObj["time"] = {
@@ -3152,6 +3174,8 @@ void EvalState::printStatistics()
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},
+        {"freeBytes", freeBytes},
+        {"unmappedBytes", unmappedBytes},
         {"totalBytes", totalBytes},
         {"cycles", gcCycles},
     };
@@ -3199,6 +3223,12 @@ void EvalState::printStatistics()
             });
         }
     }
+    return topObj;
+}
+
+void EvalState::printStatistics()
+{
+    auto topObj = getStatistics();
 
     if (getEnv("NIX_SHOW_SYMBOLS").value_or("0") != "0") {
         // XXX: overrides earlier assignment
@@ -3206,9 +3236,12 @@ void EvalState::printStatistics()
         auto & list = topObj["symbols"];
         symbols.dump([&](std::string_view s) { list.emplace_back(s); });
     }
+
+    auto outPath = getEnv("NIX_SHOW_STATS_PATH").value_or("-");
     if (outPath == "-") {
         std::cerr << topObj.dump(2) << std::endl;
     } else {
+        std::fstream fs(outPath, std::fstream::out);
         fs << topObj.dump(2) << std::endl;
     }
 }

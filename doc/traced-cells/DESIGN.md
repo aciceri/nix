@@ -110,21 +110,30 @@ ports by default.
 
 | Kind | Created at | Key | Result |
 |---|---|---|---|
-| File | `EvalState::evalFile` (`src/libexpr/eval.cc:1160`) | content hash of the file + its path relative to the root of its input (plus `mustBeTrivial`) | the file's value (usually a lambda) |
+| File | `EvalState::evalFile` (`src/libexpr/eval.cc:1160`) | resolved `SourcePath` (plus `mustBeTrivial`), see below | the file's value (usually a lambda) |
 | Call | `EvalState::callFunction`, lambda branch (`src/libexpr/eval.cc:1608`), only for lambdas **with formals** whose argument is an attrset | lambda identity + argument descriptor | WHNF of the body |
 | Derivation | `prim_derivationStrict` (`src/libexpr/primops.cc:1425`) | hash of the fully forced, context-annotated attribute set | `{ drvPath, <outputs> }` |
 | Option (phase 3) | inside `lib.modules` merge, see 5.5 | option declaration identity + identities of the definition thunks | merged option value |
 
-File cells replace `fileEvalCache`'s keying by `SourcePath` with keying by
-content hash and root-relative path; the `SourcePath → key` map is the
-per-generation fingerprint table. This alone makes a re-copied flake source
-(new `/nix/store/…-source` path after each edit) hit the cache for every
-unchanged file. The relative path is part of the key because a file's
-value depends on its location: path literals (`./foo.nix`), `import` and
-`__curPos` resolve against it, so two identical `default.nix` files in
-different directories must not share a cell. The input root is the flake
-source tree or the locked input it belongs to; files outside any input
-(absolute paths, `NIX_PATH` lookups) are keyed by absolute path.
+File cells are `fileEvalCache` kept across generations
+(`EvalState::startGeneration()`, phase P1). Its key, the resolved
+`SourcePath`, is already a content identity under pure evaluation: on this
+tree lazy trees are merged and `mountInput()` (`src/libexpr/paths.cc`)
+mounts every input, including a dirty Git work tree, at a store path
+computed from its NAR hash, so the same path always denotes the same
+contents. The per-generation fingerprint is that NAR hash, computed anyway
+when the flake is locked. Impure evaluation is refused until traces record
+reads of mutable paths.
+
+A key made of content hash and root-relative path (so that a new copy of
+an edited flake would hit for its unchanged files) is **unsound** with the
+current representation: path literals are resolved to absolute
+`SourcePath`s at parse time and `mkPos` renders absolute file names, so a
+file's value depends on the store path of its root. Consequence for P1: an
+edit gives the edited flake a new root path and all its files miss, while
+files of locked inputs (Nixpkgs, Home Manager, ...) hit. Consequence for
+P2/P3: module cells of the edited flake can only hit if the root becomes a
+port (8.3).
 
 Derivation cells are cheap insurance: when a call cell misses (for example
 a package whose file changed only in a comment), `mkDerivation` still runs
@@ -136,9 +145,10 @@ and the store write (~3 s wall on `pike`, 8.6), not evaluation.
 ### 5.2 Lambda identity
 
 `(file cell key of the file that contains the lambda, byte offset of the
-lambda in the file)`. Both are stable across store copies. The offset comes
-from `PosIdx`/`PosTable` (`src/libexpr/include/nix/expr/pos-table.hh`)
-whose origin is the `SourcePath` of the parse.
+lambda in the file)`. The offset comes from `PosIdx`/`PosTable`
+(`src/libexpr/include/nix/expr/pos-table.hh`) whose origin is the
+`SourcePath` of the parse. For files of the edited flake this identity
+changes on every edit until 8.3 is solved.
 
 Lambdas created by evaluating an expression inside a cell also carry the
 id of the **owning cell instance** (the cell whose body created the
@@ -299,22 +309,40 @@ guaranteed miss.
 
 ## 7. Resident process
 
-- A `nix eval-daemon` command (new file `src/nix/eval-daemon.cc`) built on
-  the same pieces as `nix repl` (`src/libcmd/repl.cc`: one `EvalState`,
-  `loadFlake`, `processLine`): a Unix socket, one request per line,
-  `eval <flakeref>#<attrpath>` → prints the value (or drvPath), `stats`,
-  `gc`, `quit`.
-- Per request: lock the flake, fingerprint the repository files (a few
-  hundred `readFile` + hash), map input store paths to their narHash from
-  the lock (nixpkgs is never re-hashed), bump the generation, evaluate.
+- `nix eval-daemon` (`src/nix/eval-daemon.cc`, experimental feature
+  `eval-daemon`, P1): one `EvalState`, requests one per line on standard
+  input/output or a Unix socket (`--socket`): `eval <flakeref>#<attrpath>`
+  (absolute attribute path, no `packages.<system>` probing) → drvPath or
+  JSON plus per-request stats, `stats`, `gc` (full collection, keeps
+  cached files, reports the live heap), `reset` (drops cached files),
+  `quit`. The flake is locked and called directly (`lockFlake` +
+  `callFlake` + `findAlongAttrPath`), not through installables, so the
+  SQLite eval cache is not involved. Pure evaluation only.
+- Per request: `EvalState::startGeneration()` flushes fetcher state, the
+  flake is locked again (the NAR hash of every mounted input is the
+  fingerprint), evaluate. An evaluation error drops all cached files
+  (failed thunks inside cached values may not recur).
 - `nixos-rebuild`/`nh` integration: a wrapper asks the daemon for the
   drvPath, then runs `nix build <drvPath>` and the normal activation.
-  A `--verify` mode also runs a cold evaluation in a child process and
-  compares drvPaths; this is the acceptance test during development.
-- Memory: cells hold `RootValue`s (`src/libexpr/include/nix/expr/root-value.hh`)
+  `--verify` also runs `nix eval --no-eval-cache` on the same installable
+  in a child process and compares; this is the acceptance test during
+  development.
+- Memory: cells hold `RootValue`s (`src/libexpr/include/nix/expr/value.hh`, `allocRootValue`)
   so Boehm keeps results alive. Eviction: cells not validated for N
-  generations are dropped; an explicit `gc` request drops everything but
-  the last generation's valid set.
+  generations are dropped; `gc` keeps the last generation's valid set.
+- Measured in P1: Boehm scans the C++ stack conservatively, and a deep
+  evaluation runs over stack slots where the previous deep evaluation left
+  stale pointers, so collections during generation N+1 kept most of
+  generation N alive (pike: +1.5 GiB live heap per generation, OOM after
+  about 20 generations with five hosts). The daemon therefore runs a full
+  collection at the start of every request, while the stack is shallow
+  (20-30 ms; live heap between requests 25 MiB on pike). Cells must not
+  rely on the conservative stack for liveness either way.
+- Also measured: `getFlake()` parses the root `flake.nix` through the raw
+  work tree accessor before mounting it; every generation gets a new
+  accessor, so such cache entries can never be hit again.
+  `startGeneration()` drops `fileEvalCache`/`importResolutionCache`
+  entries whose accessor is not `rootFS`, `corepkgsFS` or `internalFS`.
 
 ## 8. Complications and how each is handled
 
@@ -332,17 +360,29 @@ the lambda-with-formals branch creates cells. A partially applied lambda
 (`tApp` chain) is forced through `forceValue` (`eval-inline.hh:115`) into
 `callFunction`, so it is covered.
 
-### 8.3 Positions and `__curPos`
+### 8.3 Source root identity: path literals, positions, `__curPos`
 
+Path literals are resolved to absolute `SourcePath`s at parse time and
 `mkPos` (`src/libexpr/eval.cc:990`) renders `file` as the accessor-absolute
-path, which contains the store hash of the copied source. Two consecutive
-generations copy the repository to different store paths, so any value
-derived from `__curPos` or `unsafeGetAttrPos` differs and would invalidate
-its dependents (the `universe` flake uses `getCurrentDir __curPos` in
-every project). Options: (a) evaluate the repository through `lazy-trees`
-(no copy, stable virtual path); (b) render positions relative to the
-flake root inside the daemon. (a) is the intended path; (b) is a fallback
-that changes observable strings and is therefore off by default.
+path. Both contain the store path of the flake root, which on this tree is
+the NAR hash of the whole tree (`mountInput()`, lazy trees without stable
+virtual paths). Every edit therefore changes every file identity, path
+value and position of the edited flake (the `universe` flake uses
+`getCurrentDir __curPos` in every project).
+
+Plan for P2: make the source root a port. Parsing produces `(root port,
+relative path)` for path literals and positions; `import`, `readFile` and
+path concatenation resolve through the port (reading the current
+generation), and rendering the absolute path (`toString`, interpolation,
+`__curPos.file`, `mkPos`) is an observation of the root's store path. File
+and lambda identities become `(input identity, relative path, content
+hash)`. Cells that only import through paths keep hitting after an edit;
+cells that stringify paths miss, which is correct because their result
+contains the old store path. If too many cells stringify paths in practice
+(`getCurrentDir __curPos` does), the fallback is a stable virtual root
+path per flake, rewritten to the content path when a string reaches
+`derivationStrict` or the store; that changes observable strings during
+evaluation and must be validated with `--verify`.
 
 ### 8.4 Errors, `tryEval`, `abort`, `throw`
 
@@ -413,13 +453,13 @@ backing store for the cell table.
 | `src/libexpr/include/nix/expr/value.hh` | new `tPort` internal type (single-dword slot) |
 | `src/libexpr/include/nix/expr/eval.hh` | `CellTable`, `PortTable`, `TraceStack`, `Fingerprints` members; `PrimOp::readsInput` |
 | `src/libexpr/include/nix/expr/eval-inline.hh` | `forceValue`: resolve ports, push cell ownership on thunk force |
-| `src/libexpr/eval.cc` | `evalFile` → file cells by content hash; `callFunction` lambda branch → call cells; `ExprSelect::eval`, `lookupVar`, `ExprOpHasAttr::eval` → observations; `ExprLambda::eval` → owning cell tag; `mkPos` (8.3) |
+| `src/libexpr/eval.cc` | P1: `startGeneration()` (flush fetcher state, keep `fileEvalCache`), `getStatistics()` split out of `printStatistics()` with free/unmapped heap bytes. P2+: `evalFile` file identity via root port (8.3); `callFunction` lambda branch → call cells; `ExprSelect::eval`, `lookupVar`, `ExprOpHasAttr::eval` → observations; `ExprLambda::eval` → owning cell tag; `mkPos` (8.3) |
 | `src/libexpr/primops.cc`, `primops/fetchTree.cc`, `primops/context.cc` | input flags and recording; `derivationStrict` cells; `attrNames`/`functionArgs`/`typeOf`/… observations on ports |
 | `src/libexpr/traced-cells.{hh,cc}` (new) | cell/trace/summary data structures, validation, eviction, statistics |
-| `src/libcmd/repl.cc` | factor the resident `EvalState` + flake loading for reuse |
-| `src/nix/eval-daemon.cc` (new) | socket front end, generations, `--verify` |
-| `doc/manual/source/command-ref/new-cli/nix3-eval-daemon.md` | documentation |
-| `tests/functional/traced-cells/` | see section 11 |
+| `src/nix/eval-daemon.cc` (new, P1) | stdio/socket front end, generations, `gc`/`reset`, `--verify`; locks and calls the flake directly, so `repl.cc` needed no refactoring |
+| `src/nix/eval-daemon.md` (new, P1) | command documentation (manual page `nix3-eval-daemon`) |
+| `src/libutil/experimental-features.cc` (P1) | `eval-daemon` experimental feature |
+| `tests/functional/flakes/eval-daemon.sh` (new, P1) | daemon protocol, reuse of locked inputs, error reset, `--verify` |
 
 Rough size: 4-6 k lines including tests. The evaluator core is touched in
 five functions; the rest is additive.
@@ -438,10 +478,15 @@ against a cold `nix-instantiate --readonly-mode`.
   drvPath cached per git tree hash (`refs.tsv`). That check is the
   comparator until the daemon exists; `nix eval-daemon --verify` (a cold
   evaluation in a child process) comes with P1.
-- **P1** (resident + file cells): daemon skeleton, file cells keyed by
-  content hash and root-relative path, generations, fingerprinting.
-  Expected gain: parsing only (~5%). Acceptance: identical drvPath over 20
-  edit/restore cycles; RSS stable.
+- **P1** (resident + file cells): daemon skeleton, `fileEvalCache` kept
+  across generations (5.1), per-generation flush of fetcher state,
+  fingerprinting via the NAR hash of mounted inputs. Expected gain: parsing
+  only (~5%). Acceptance: identical drvPath over 20 edit/restore cycles;
+  RSS stable.
+  Done: 400 generations (20 cycles, 2 edits, 5 hosts) with identical
+  drvPaths, RSS 2.49 GiB at generation 10 and 2.58 GiB at 400. Pike after
+  an edit, 8 GiB initial heap: 9.58 → 8.56 s CPU, 10.7 → 8.6 s wall
+  (numbers in `universe` `projects/fasteval/NOTES.md`, section "P1").
 - **P1b** (nixpkgs instance cell, no traces): a special case of a call cell
   for the top-level `import nixpkgs { ... }` keyed structurally (overlay
   owning file hashes + config hash + system). Reproduces the resident-repl

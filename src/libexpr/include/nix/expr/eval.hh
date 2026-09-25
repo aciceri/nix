@@ -23,6 +23,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <map>
 #include <optional>
@@ -516,6 +517,11 @@ private:
         fileEvalCache;
 
     /**
+     * See `startGeneration()`.
+     */
+    uint64_t generation = 0;
+
+    /**
      * Associate source positions of certain AST nodes with their preceding doc comment, if they have one.
      * Grouped by file.
      */
@@ -656,6 +662,33 @@ public:
     void evalFile(const SourcePath & path, Value & v, bool mustBeTrivial = false);
 
     void resetFileCache();
+
+    /**
+     * Start a new evaluation in a long-lived `EvalState` (for example
+     * `nix eval-daemon`). Drops the per-evaluation caches (fetched inputs,
+     * Git work tree info, lookup path resolution, filesystem metadata) so
+     * that changed inputs are fetched and hashed again, and the cached files
+     * of per-input accessors, which cannot be hit again. Keeps the parsed
+     * and evaluated files under the root filesystem (including the store)
+     * and the built-in accessors in `fileEvalCache`.
+     *
+     * Keeping evaluated files is sound only under pure evaluation: every
+     * file is then read from a store path or from an input mounted at a
+     * store path computed from its NAR hash (`mountInput()`), so a cached
+     * path always denotes the same contents, and forced thunks inside a
+     * cached file value cannot have read anything mutable.
+     */
+    void startGeneration();
+
+    /**
+     * Number of evaluations started with `startGeneration()`.
+     */
+    uint64_t getGeneration() const
+    {
+        return generation;
+    }
+
+    size_t fileEvalCacheSize() const;
 
     /**
      * Look up a file in the search path.
@@ -1104,6 +1137,11 @@ public:
      * Print statistics, unconditionally, cheaply, without performing a GC first.
      */
     void printStatistics();
+
+    /**
+     * The statistics printed by `printStatistics()`, as JSON.
+     */
+    nlohmann::json getStatistics();
 
     /**
      * Perform a full memory garbage collection - not incremental.

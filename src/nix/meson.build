@@ -93,6 +93,7 @@ nix_sources = [ config_priv_h ] + files(
   'dump-path.cc',
   'edit.cc',
   'env.cc',
+  'eval-daemon.cc',
   'eval.cc',
   'flake-prefetch-inputs.cc',
   'flake.cc',

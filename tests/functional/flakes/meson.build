@@ -21,6 +21,7 @@ suites += {
     'flake-in-submodule.sh',
     'prefetch.sh',
     'eval-cache.sh',
+    'eval-daemon.sh',
     'search-root.sh',
     'config.sh',
     'show.sh',
