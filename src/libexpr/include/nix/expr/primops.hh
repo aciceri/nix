@@ -38,4 +38,10 @@ void prim_exec(EvalState & state, CallSite callSite, Value * const * args, Value
 
 void makePositionThunks(EvalState & state, const PosIdx pos, Value & line, Value & column);
 
+/**
+ * A thunk for the file name of a position, rendered when forced (see
+ * `EvalState::pathToString()`).
+ */
+void makeLazyPositionFile(EvalState & state, const PosIdx pos, Value & file);
+
 } // namespace nix

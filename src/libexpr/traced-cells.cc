@@ -53,11 +53,20 @@ struct PortRef : ExternalValueBase, gc
 
 using FormalNames = std::vector<std::pair<Symbol, bool>, gc_allocator<std::pair<Symbol, bool>>>;
 
-FormalNames formalsOf(Value & f)
+/**
+ * The formals of a function, looking through proxies of other cells
+ * (which records the observation in them).
+ */
+FormalNames formalsOf(EvalState & state, Value & f0)
 {
+    Value * f = &f0;
+    while (auto backing = state.cells->observeFunctionArgs(state, *f)) {
+        state.forceValue(*backing, noPos);
+        f = backing;
+    }
     FormalNames res;
-    if (f.isLambda())
-        if (auto formals = f.lambda().fun->getFormals())
+    if (f->isLambda())
+        if (auto formals = f->lambda().fun->getFormals())
             for (auto & i : formals->formals)
                 res.emplace_back(i.name, i.def != nullptr);
     return res;
@@ -295,20 +304,21 @@ void StableRoots::mount(
         root = &*r;
     }
 
+    bool changed = !root->realPrefix.empty() && root->realPrefix != real;
     if (root->realPrefix != real) {
-        if (!root->realPrefix.empty()) {
-            /* The tree changed: evaluated files may have read anything
-               in it. Parsed files are kept (`parsed`, by content). */
+        if (!root->realPrefix.empty())
             byReal.erase(root->realPrefix);
-            auto dir = root->virtualPrefix + "/";
-            state.dropFileCacheUnder(dir);
-            boost::unordered::erase_if(contentHashes, [&](auto & entry) { return entry.first.starts_with(dir); });
-        }
         root->realPrefix = real;
         byReal.insert_or_assign(real, root);
     }
     root->target = accessor;
     root->generation = state.getGeneration();
+
+    /* The tree changed: keep the evaluated files that did not change and
+       did not read anything that changed. Parsed files are kept anyway
+       (`parsed`, by content). */
+    if (changed)
+        revalidateFiles(state, *root);
 }
 
 std::string_view StableRoots::storePrefix(std::string_view path) const
@@ -317,6 +327,78 @@ std::string_view StableRoots::storePrefix(std::string_view path) const
         return {};
     auto end = path.find('/', storeDir.size() + 1);
     return path.substr(0, end == path.npos ? path.size() : end);
+}
+
+uint64_t StableRoots::fileVersion(const std::string & path) const
+{
+    auto i = fileVersions.find(path);
+    return i == fileVersions.end() ? 0 : i->second;
+}
+
+void StableRoots::revalidateFiles(EvalState & state, StableRoot & root)
+{
+    auto dir = root.virtualPrefix + "/";
+
+    std::vector<std::string> paths;
+    for (auto & [path, cell] : fileCells)
+        if (path.starts_with(dir))
+            paths.push_back(path);
+
+    boost::unordered_flat_set<std::string> dropped;
+
+    /* Files whose text changed. */
+    for (auto & path : paths) {
+        auto old = contentHashes.find(path);
+        std::optional<std::string> now;
+        try {
+            now = contentFingerprint(SourcePath{state.rootFS, CanonPath(path)}.resolveSymlinks().readFile());
+        } catch (Error &) {
+        }
+        if (old == contentHashes.end() || !now || *now != old->second)
+            dropped.insert(path);
+    }
+
+    /* Files whose reads changed, including imports of dropped files, to a
+       fixed point. */
+    for (bool again = true; again;) {
+        again = false;
+        for (auto & path : paths) {
+            if (dropped.contains(path))
+                continue;
+            for (auto & read : fileCells[path]->fileReads) {
+                bool valid;
+                if (read.root->generation != state.getGeneration())
+                    valid = false;
+                else if (read.kind == FileReadKind::Import) {
+                    std::string_view fp = state.symbols[read.fingerprint];
+                    valid = !dropped.contains(std::string(fp.substr(0, fp.find('\n'))))
+                            && fileReadFingerprint(state, read) == fp;
+                } else
+                    valid = read.checkedAt == state.symbols.create(read.root->realPrefix)
+                            || fileReadFingerprint(state, read) == state.symbols[read.fingerprint];
+                if (!valid) {
+                    dropped.insert(path);
+                    again = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (auto & path : dropped) {
+        fileVersions[path]++;
+        fileCells.erase(path);
+        contentHashes.erase(path);
+        state.dropFileCacheEntry(path);
+    }
+    /* Resolution of imports (`default.nix`) may have changed. */
+    state.dropImportResolutionUnder(dir);
+
+    debug(
+        "stable root '%s' changed: kept %d evaluated files, dropped %d",
+        root.identity,
+        paths.size() - dropped.size(),
+        dropped.size());
 }
 
 StableRoot * StableRoots::findVirtual(std::string_view path)
@@ -354,6 +436,8 @@ std::string EvalState::pathToString(const SourcePath & path)
     auto root = stableRoots->findVirtual(abs);
     if (!root)
         return std::string(abs);
+    if (mem.currentOwner && verbosity >= lvlVomit) [[unlikely]]
+        printMsg(lvlVomit, "traced cell render of '%s'", abs);
     recordFileRead(FileReadKind::Render, SourcePath{rootFS, CanonPath(root->virtualPrefix)}, root->realPrefix);
     return root->realPrefix + std::string(abs.substr(root->virtualPrefix.size()));
 }
@@ -417,7 +501,9 @@ std::string fileReadFingerprint(EvalState & state, const FileRead & read)
 
         case FileReadKind::Import: {
             auto resolved = resolveExprPath(path);
-            return resolved.path.abs() + "\n" + contentFingerprint(resolved.resolveSymlinks().readFile());
+            auto abs = std::string(resolved.path.abs());
+            return abs + "\n" + contentFingerprint(resolved.resolveSymlinks().readFile()) + "\n"
+                   + std::to_string(state.stableRoots->fileVersion(abs));
         }
 
         case FileReadKind::Resolve: {
@@ -631,7 +717,8 @@ void ExprPort::observe(EvalState & state, Value & b)
     /* Not for call results: a call may compute its result afresh, so the
        result of replaying it is a different object even when nothing
        changed. */
-    if (auto [owner, object, env] = objectOf(b); kind != Kind::Call && owner && owner != cell) {
+    if (auto [owner, object, env] = objectOf(b);
+        state.cells->identitySummaries && kind != Kind::Call && owner && owner != cell) {
         identity[0] = object;
         identity[1] = env;
         summary = Summary::Identity;
@@ -1067,7 +1154,7 @@ bool CellTable::validate(EvalState & state, CellInstance & cell, Value * rootBac
                 why = "a function is no longer a function";
                 return false;
             }
-            if (port.functionArgsObserved && formalsOf(b) != port.functionArgs) {
+            if (port.functionArgsObserved && formalsOf(state, b) != port.functionArgs) {
                 why = "function arguments changed";
                 return false;
             }
@@ -1244,9 +1331,20 @@ void CellTable::startGeneration(EvalState & state)
             forget(cell);
         return cell->unusable;
     });
+
+    /* Most recently bound first. Keep a few instances per function and
+       call site (an edit is often undone, and a site may serve several
+       calls), and at most `maxInstances` overall. */
+    std::ranges::stable_sort(instances, [](auto * a, auto * b) { return a->boundGen > b->boundGen; });
+    std::map<std::tuple<ExprLambda *, Symbol, size_t>, size_t> perCall;
+    std::erase_if(instances, [&](auto * cell) {
+        if (++perCall[{cell->lambda, cell->callSite, cell->ordinal}] <= maxPerCall)
+            return false;
+        forget(cell);
+        return true;
+    });
     if (instances.size() <= maxInstances)
         return;
-    std::ranges::sort(instances, [](auto * a, auto * b) { return a->boundGen > b->boundGen; });
     for (size_t n = maxInstances; n < instances.size(); ++n)
         forget(instances[n]);
     instances.resize(maxInstances);
@@ -1292,7 +1390,7 @@ Value * CellTable::observeFunctionArgs(EvalState & state, Value & v)
     auto & port = *dynamic_cast<PortRef &>(*v.primOpApp().right->external()).port;
     port.cell->noteUse(state);
     if (!port.functionArgsObserved) {
-        port.functionArgs = formalsOf(*port.backing);
+        port.functionArgs = formalsOf(state, *port.backing);
         port.functionArgsObserved = true;
     }
     return port.backing;

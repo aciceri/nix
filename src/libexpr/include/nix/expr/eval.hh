@@ -737,6 +737,16 @@ public:
     void dropFileCacheUnder(std::string_view dir);
 
     /**
+     * Drop the evaluated file at `path` (an absolute path in `rootFS`).
+     */
+    void dropFileCacheEntry(std::string_view path);
+
+    /**
+     * Drop the resolutions of imports of paths under `dir`.
+     */
+    void dropImportResolutionUnder(std::string_view dir);
+
+    /**
      * Traced cells (doc/traced-cells/DESIGN.md), only in a long-lived
      * `EvalState` that calls `startGeneration()`. Null when disabled.
      */

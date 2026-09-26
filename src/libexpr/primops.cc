@@ -3311,12 +3311,22 @@ static struct LazyPosAccessors
             v.mkInt(state.positions[PosIdx(args[0]->integer().value)].column);
         }};
 
-    Value lineOfPos, columnOfPos;
+    /* The file name of a position contains the store path of its tree,
+       which for a stable root is only known in the current generation
+       (and read by traced cells when rendered). */
+    PrimOp primop_fileOfPos{
+        .arity = 1, .impl = [](EvalState & state, CallSite callSite, Value * const * args, Value & v) {
+            auto origin = state.positions.originOf(PosIdx(args[0]->integer().value));
+            v.mkString(state.pathToString(std::get<SourcePath>(origin)), state.mem);
+        }};
+
+    Value lineOfPos, columnOfPos, fileOfPos;
 
     LazyPosAccessors()
     {
         lineOfPos.mkPrimOp(&primop_lineOfPos);
         columnOfPos.mkPrimOp(&primop_columnOfPos);
+        fileOfPos.mkPrimOp(&primop_fileOfPos);
     }
 
     void operator()(EvalState & state, const PosIdx pos, Value & line, Value & column)
@@ -3326,11 +3336,23 @@ static struct LazyPosAccessors
         line.mkApp(&lineOfPos, posV);
         column.mkApp(&columnOfPos, posV);
     }
+
+    void file(EvalState & state, const PosIdx pos, Value & file)
+    {
+        Value * posV = state.allocValue();
+        posV->mkInt(pos.id);
+        state.mkLazyApp(file, &fileOfPos, posV);
+    }
 } makeLazyPosAccessors;
 
 void makePositionThunks(EvalState & state, const PosIdx pos, Value & line, Value & column)
 {
     makeLazyPosAccessors(state, pos, line, column);
+}
+
+void makeLazyPositionFile(EvalState & state, const PosIdx pos, Value & file)
+{
+    makeLazyPosAccessors.file(state, pos, file);
 }
 
 /* Dynamic version of the `?' operator. */

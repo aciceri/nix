@@ -3,6 +3,7 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-gc.hh"
+#include "nix/util/environment-variables.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -123,6 +124,37 @@ struct StableRoots
      * and positions) when its tree changes.
      */
     boost::unordered_flat_map<std::string, std::pair<std::string, Expr *>> parsed;
+
+    /**
+     * File cells: the context (a `CellInstance` without a function) in
+     * which a file of a stable root was evaluated. It collects the file
+     * reads made while evaluating the file and forcing thunks created at
+     * its top level, so that the evaluated file can be kept when its tree
+     * changes. By path.
+     */
+    boost::unordered_flat_map<
+        std::string,
+        CellInstance *,
+        boost::hash<std::string>,
+        std::equal_to<std::string>,
+        traceable_allocator<std::pair<const std::string, CellInstance *>>>
+        fileCells;
+
+    /**
+     * Version of the evaluated value of a file of a stable root: increased
+     * whenever it is dropped, so that importers (whose `Import` reads
+     * include it) notice even if the file's text is the same.
+     */
+    boost::unordered_flat_map<std::string, uint64_t> fileVersions;
+
+    uint64_t fileVersion(const std::string & path) const;
+
+    /**
+     * After `root` changed: keep the evaluated files under it whose
+     * contents and reads (including the versions of the files they
+     * import) are unchanged, drop the others.
+     */
+    void revalidateFiles(EvalState & state, StableRoot & root);
 
     /**
      * Mount `accessor` (the contents of an unlocked input whose store path
@@ -421,7 +453,19 @@ struct CellTable
 
     std::vector<std::string> fileSuffixes;
     size_t maxInstances;
+
+    /**
+     * Compare values created by other cells by identity instead of
+     * reading them through proxies (experiment: NIX_TRACED_CELLS_IDENTITY=0
+     * disables it).
+     */
+    bool identitySummaries = getEnv("NIX_TRACED_CELLS_IDENTITY").value_or("1") != "0";
     static constexpr size_t maxPorts = 100000;
+
+    /**
+     * Instances kept per function, call site and call ordinal.
+     */
+    static constexpr size_t maxPerCall = 16;
     std::vector<CellInstance *, traceable_allocator<CellInstance *>> instances;
     RootValue vPortCall;
     Stats stats;

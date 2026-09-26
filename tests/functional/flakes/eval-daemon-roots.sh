@@ -17,10 +17,16 @@ daemonLog=$TEST_ROOT/eval-daemon-roots.log
 createGitRepo "$flakeDir" ""
 mkdir -p "$flakeDir/pkgs/top-level" "$flakeDir/dir"
 cat > "$flakeDir/pkgs/top-level/impure.nix" <<'EOF'
+# The function closes over this `let`: the evaluated file is kept when the
+# tree changes (a file cell), unless something it read changed.
+let
+  top = builtins.readFile ../../top.txt;
+in
 { config ? { }, ... }:
 # Read the argument right away, so that each call gets its own instance.
 assert builtins.isString config.name;
 {
+  inherit top;
   imported = (import ../../lib.nix).value;
   contents = builtins.readFile ../../data.txt;
   exists = builtins.pathExists ../../maybe.nix;
@@ -36,7 +42,7 @@ cat > "$flakeDir/flake.nix" <<'EOF'
   outputs = { self }:
     let
       get = name: attr: (import ./pkgs/top-level/impure.nix { config.name = name; }).${attr};
-      names = [ "imported" "contents" "exists" "listing" "copied" "filtered" "rendered" "lazy" ];
+      names = [ "imported" "contents" "exists" "listing" "copied" "filtered" "rendered" "lazy" "top" ];
     in
     builtins.listToAttrs (map (name: { inherit name; value = get name name; }) names)
     // { importedLazy = get "imported" "lazy"; };
@@ -48,6 +54,7 @@ echo '"lazy1"' > "$flakeDir/lazy.nix"
 echo a > "$flakeDir/dir/a"
 echo s > "$flakeDir/dir/skip"
 echo 1 > "$flakeDir/unrelated.nix"
+echo -n top1 > "$flakeDir/top.txt"
 git -C "$flakeDir" add -A
 git -C "$flakeDir" commit -m init
 
@@ -67,7 +74,7 @@ check() {
     [[ $(jq .verify.matches <<< "$reply") == true ]]
 }
 
-names="imported contents exists listing copied filtered rendered lazy"
+names="imported contents exists listing copied filtered rendered lazy top"
 
 # One instance per attribute, each reading its own file.
 for attr in $names; do
@@ -95,6 +102,9 @@ editAndCheck() {
     check "$attr" 0 1
 }
 editAndCheck imported lib.nix '{ value = "two"; }'
+# A file read by the top level of the file defining the function: the
+# evaluated file is dropped, so every instance of its function is new.
+editAndCheck top top.txt top2
 editAndCheck contents data.txt data2
 editAndCheck exists maybe.nix '{ }'
 editAndCheck listing dir/b b

@@ -665,3 +665,56 @@ are correct, but after any edit 27 of 72 cells are recomputed. The
 string really depends on them), and every flake that uses `nixpkgs.lib`
 compares it by identity with the recomputed one. Removing that cascade is
 phase 2.
+
+## 14. Generic memoisation, phase 2 (partial)
+
+Measured on a local Nixpkgs checkout used with `--override-input`
+(`nixpkgs-edit.py`, `nixpkgs-log.sh`), which is the generic case: an
+unlocked tree that other cells depend on.
+
+Implemented:
+
+- **File cells.** A function closes over the environment of its file's
+  top level (`impure.nix` is `let …; in { … }: …`), and cell keys contain
+  that environment. Dropping every evaluated file of a changed tree
+  therefore removed every candidate. Files of stable roots are now
+  evaluated in the context of a file cell (`StableRoots::fileCells`) that
+  collects the reads of the top level, including thunks forced later.
+  When the tree changes, `StableRoots::revalidateFiles()` keeps the
+  evaluated files whose text and reads are unchanged, to a fixed point
+  over imports; `Import` fingerprints include the version of the imported
+  file, bumped when it is dropped, so importers notice.
+- **Fewer spurious renders.** A path that starts a path concatenation is
+  not rendered (the result is a path under the same root). The `file` of
+  a position is a lazy thunk rendered when read (like `line` and
+  `column`), so `unsafeGetAttrPos` alone (e.g. `meta.position` in
+  `mkDerivation`) does not depend on the store path of the tree.
+- **Functions behind proxies.** `functionArgs` observations look through
+  proxies of other cells.
+- **Instances per call.** At most 16 instances per function, call site
+  and ordinal, so a site that keeps missing does not accumulate instances
+  up to the global limit.
+
+Experiment, off by default (`NIX_TRACED_CELLS_IDENTITY=0`): read values of
+other cells through proxies instead of comparing them by identity.
+
+| | `universe`, pike after an edit | local Nixpkgs, cells recomputed per edit (of 72) |
+|---|---|---|
+| identity (default) | 3.1-3.5 s, RSS stable 4.5 GiB | 20-27 |
+| structural reads | 3.5-3.8 s, live heap +670 MiB per request, 2 cells always recomputed | 8 (1 when an edit is undone) |
+
+Why structural reads are not the default yet: the first request records
+5.7 M ports on pike; a function reached by two paths comes back as two
+objects when calls are replayed (`buildGoModule.override`), which the
+aliasing rule rightly rejects; and something retains dropped instances.
+
+What remains, even with structural reads, for a local Nixpkgs checkout:
+the Nixpkgs instances are recomputed after every edit because code inside
+them renders paths of the tree as strings (`lib.fileset` in the `nix`
+package, setup hooks). Those strings do depend on the store path, so the
+only generic remedy is finer granularity: cells for package applications
+chosen by cost (phase 3), with the instance recomputed around them and
+the packages reused. That requires reads of nested cells not to be
+charged to the enclosing cell when the enclosing cell is recomputed
+rather than reused (Salsa-style), which the current propagation of file
+reads to parents does not allow.

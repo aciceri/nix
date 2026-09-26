@@ -993,7 +993,10 @@ void EvalState::mkPos(Value & v, PosIdx p)
     auto origin = positions.originOf(p);
     if (auto path = std::get_if<SourcePath>(&origin)) {
         auto attrs = buildBindings(3);
-        attrs.alloc(s.file).mkString(pathToString(*path), mem);
+        if (stableRoots) [[unlikely]]
+            makeLazyPositionFile(*this, p, attrs.alloc(s.file));
+        else
+            attrs.alloc(s.file).mkString(path->path.abs(), mem);
         makePositionThunks(*this, p, attrs.alloc(s.line), attrs.alloc(s.column));
         v.mkAttrs(attrs);
     } else
@@ -1134,6 +1137,17 @@ struct ExprParseFile : Expr, gc
     {
         printTalkative("evaluating file '%s'", path);
 
+        /* Files of stable roots are evaluated in the context of a file
+           cell that collects their reads (see `StableRoots::fileCells`). */
+        auto savedOwner = state.mem.currentOwner;
+        Finally restoreOwner([&]() { state.mem.currentOwner = savedOwner; });
+        if (state.stableRoots && &*path.accessor == &*state.rootFS) [[unlikely]]
+            if (state.stableRoots->findVirtual(path.path.abs())) {
+                auto fileCell = new CellInstance();
+                state.stableRoots->fileCells.insert_or_assign(std::string(path.path.abs()), fileCell);
+                state.mem.currentOwner = fileCell;
+            }
+
         auto e = state.parseExprFromFile(path);
 
         try {
@@ -1171,14 +1185,16 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     }
 
     if (recordsFileReads(path)) [[unlikely]] {
-        auto hash = stableRoots->contentHashes.find(std::string(resolvedPath->path.abs()));
+        auto abs = std::string(resolvedPath->path.abs());
+        auto hash = stableRoots->contentHashes.find(abs);
         recordFileRead(
             FileReadKind::Import,
             path,
-            std::string(resolvedPath->path.abs()) + "\n"
+            abs + "\n"
                 + (hash != stableRoots->contentHashes.end()
                        ? hash->second
-                       : contentFingerprint(resolvedPath->resolveSymlinks().readFile())));
+                       : contentFingerprint(resolvedPath->resolveSymlinks().readFile()))
+                + "\n" + std::to_string(stableRoots->fileVersion(abs)));
     }
 
     if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
@@ -1257,6 +1273,19 @@ void EvalState::enableCells(std::vector<std::string> fileSuffixes, size_t maxIns
 size_t EvalState::fileEvalCacheSize() const
 {
     return fileEvalCache->size();
+}
+
+void EvalState::dropImportResolutionUnder(std::string_view dir)
+{
+    auto under = [&](const SourcePath & path) {
+        return &*path.accessor == &*rootFS && path.path.abs().starts_with(dir);
+    };
+    importResolutionCache->erase_if([&](auto & entry) { return under(entry.first) || under(entry.second); });
+}
+
+void EvalState::dropFileCacheEntry(std::string_view path)
+{
+    fileEvalCache->erase(SourcePath{rootFS, CanonPath(path)});
 }
 
 void EvalState::dropFileCacheUnder(std::string_view dir)
@@ -2268,8 +2297,14 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
             /* skip canonization of first path, which would only be not
             canonized in the first place if it's coming from a ./${foo} type
             path */
-            auto part = state.coerceToString(
-                i_pos, vTmp, context, "while evaluating a path segment", false, firstType == nString, !first);
+            /* A path that starts a path concatenation is not rendered:
+               the result is a path again, under the same (possibly stable)
+               root, and does not depend on the root's store path. */
+            auto part =
+                first && firstType == nPath
+                    ? BackedStringView(vTmp.pathStrView())
+                    : state.coerceToString(
+                          i_pos, vTmp, context, "while evaluating a path segment", false, firstType == nString, !first);
             sSize += part->size();
             strings.emplace_back(std::move(part));
         }
