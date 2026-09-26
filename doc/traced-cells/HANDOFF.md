@@ -31,6 +31,11 @@ numbers behind the design, the repository state and the rules.
   3.5-3.9 s per pike request after the first. Switching was never run.
   `projects/fasteval/fasteval.service`: systemd user unit with `--warm`
   (not installed). Memory is stable over distinct edits (pike 4.5 GiB).
+- 2026-09-26: Andrea asked for a generic mechanism (not tuned to
+  universe). Plan and status in DESIGN.md section 13: phase 1 (stable
+  roots, file reads in traces) done; next phase 2 (structural reads of
+  other cells' values with early cutoff instead of identity summaries),
+  then 3 (cell sites chosen by cost), 4 (persistence).
 - Andrea chose (2026-09-25) not to pursue module/option cells (they need a
   stable virtual root or root-relative paths, DESIGN 8.3) and to
   consolidate instead. Open: persistence across restarts (P4).
