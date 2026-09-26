@@ -1,5 +1,6 @@
 #include "nix/store/store-api.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/traced-cells.hh"
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 
@@ -7,6 +8,11 @@ namespace nix {
 
 SourcePath EvalState::rootPath(CanonPath path)
 {
+    /* A file of the current tree of an unlocked input is known under the
+       input's stable virtual path, see `StableRoot`. */
+    if (stableRoots) [[unlikely]]
+        if (auto root = stableRoots->findReal(path.abs()))
+            return {rootFS, CanonPath(root->virtualPrefix + std::string(path.abs().substr(root->realPrefix.size())))};
     return {rootFS, std::move(path)};
 }
 
@@ -14,7 +20,7 @@ SourcePath EvalState::rootPath(std::string_view path)
 {
     /* FIXME: Move this out of EvalState, since it's using native
        std::filesystem::path and current working directory. */
-    return {rootFS, CanonPath(absPath(path).string())};
+    return rootPath(CanonPath(absPath(path).string()));
 }
 
 SourcePath EvalState::storePath(const StorePath & path)
@@ -75,6 +81,9 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
     allowPath(storePath); // FIXME: should just whitelist the entire virtual store
 
     storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
+
+    if (stableRoots && !originalInput.isLocked(fetchSettings))
+        stableRoots->mount(*this, originalInput.to_string(), storePath, accessor);
 
     input.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
 

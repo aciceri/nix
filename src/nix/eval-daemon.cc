@@ -460,7 +460,8 @@ struct CmdEvalDaemon : MixFlakeOptions, MixReadOnlyOption
         auto locked = flake::lockFlake(flakeSettings, state, flakeRef, lockFlags);
         auto root = locked.flake.path.parent().path.abs() + "/";
         if (state.cells)
-            state.cells->excludedRoot = root;
+            /* The flake's own files are known under its stable root. */
+            state.cells->excludedRoot = state.rootPath(locked.flake.path.parent().path).path.abs() + "/";
         rememberRoot(state, root);
         auto vFlake = state.allocValue();
         flake::callFlake(state, locked, *vFlake);

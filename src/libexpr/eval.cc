@@ -993,7 +993,7 @@ void EvalState::mkPos(Value & v, PosIdx p)
     auto origin = positions.originOf(p);
     if (auto path = std::get_if<SourcePath>(&origin)) {
         auto attrs = buildBindings(3);
-        attrs.alloc(s.file).mkString(path->path.abs(), mem);
+        attrs.alloc(s.file).mkString(pathToString(*path), mem);
         makePositionThunks(*this, p, attrs.alloc(s.line), attrs.alloc(s.column));
         v.mkAttrs(attrs);
     } else
@@ -1170,6 +1170,17 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         importResolutionCache->emplace(path, *resolvedPath);
     }
 
+    if (recordsFileReads(path)) [[unlikely]] {
+        auto hash = stableRoots->contentHashes.find(std::string(resolvedPath->path.abs()));
+        recordFileRead(
+            FileReadKind::Import,
+            path,
+            std::string(resolvedPath->path.abs()) + "\n"
+                + (hash != stableRoots->contentHashes.end()
+                       ? hash->second
+                       : contentFingerprint(resolvedPath->resolveSymlinks().readFile())));
+    }
+
     if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
         forceValue(**v2, noPos);
         v = **v2;
@@ -1237,6 +1248,7 @@ void EvalState::enableCells(std::vector<std::string> fileSuffixes, size_t maxIns
 {
 #if NIX_USE_BOEHMGC
     cells = std::make_unique<CellTable>(*this, std::move(fileSuffixes), maxInstances);
+    stableRoots = std::make_unique<StableRoots>(store->storeDir);
 #else
     throw Error("traced cells require Nix to be built with the Boehm garbage collector");
 #endif
@@ -2620,11 +2632,17 @@ BackedStringView EvalState::coerceToString(
         if (!canonicalizePath && !copyToStore) {
             // FIXME: hack to preserve path literals that end in a
             // slash, as in /foo/${x}.
+            if (stableRoots) [[unlikely]] {
+                auto s = pathToString(v.path());
+                if (v.pathStrView().ends_with("/") && !s.ends_with("/"))
+                    s += "/";
+                return s;
+            }
             return v.pathStrView();
         } else if (copyToStore) {
             return store->printStorePath(copyPathToStore(context, v.path()));
         } else {
-            return std::string{v.path().path.abs()};
+            return pathToString(v.path());
         }
     }
 
@@ -2715,16 +2733,27 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
     if (nix::isDerivation(path.path.abs()))
         error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
 
+    /* Copy from the current store path of a stable root: the source-to-store
+       cache is keyed by path, and the contents under the stable path change
+       between generations. */
     auto dstPath = fetchToStore(
         fetchSettings,
         *store,
-        path.resolveSymlinks(SymlinkResolution::Ancestors),
+        toRealPath(path).resolveSymlinks(SymlinkResolution::Ancestors),
         settings.isReadOnly() ? FetchMode::DryRun : FetchMode::Copy,
         path.baseName(),
         ContentAddressMethod::Raw::NixArchive,
         nullptr,
         repair);
     allowPath(dstPath);
+    if (recordsFileReads(path)) [[unlikely]]
+        recordFileRead(
+            FileReadKind::Copy,
+            path,
+            fmt("%s\n%s\n%s",
+                ContentAddressMethod(ContentAddressMethod::Raw::NixArchive).render(),
+                path.baseName(),
+                store->printStorePath(dstPath)));
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;
@@ -3339,6 +3368,24 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path)
 Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv)
 {
     auto buffer = path.resolveSymlinks().readFile();
+
+    /* Files of stable roots keep their expressions while their contents
+       do not change, so that lambdas and positions keep their identity
+       when the tree changes. */
+    if (stableRoots && staticEnv == staticBaseEnv && &*path.accessor == &*rootFS) [[unlikely]]
+        if (stableRoots->findVirtual(path.path.abs())) {
+            auto key = std::string(path.path.abs());
+            auto hash = contentFingerprint(buffer);
+            stableRoots->contentHashes.insert_or_assign(key, hash);
+            auto & parsed = stableRoots->parsed[key];
+            if (parsed.second && parsed.first == hash)
+                return parsed.second;
+            buffer.append("\0\0", 2);
+            auto e = parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
+            parsed = {hash, e};
+            return e;
+        }
+
     // readFile hopefully have left some extra space for terminators
     buffer.append("\0\0", 2);
     return parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);

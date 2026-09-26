@@ -41,7 +41,7 @@ json printValueAsJSON(
         if (copyToStore)
             out = state.store->printStorePath(state.copyPathToStore(context, v.path()));
         else
-            out = v.path().path.abs();
+            out = state.pathToString(v.path());
         break;
 
     case nNull:

@@ -27,7 +27,7 @@ static void printValueAsXML(
 static void posToXML(EvalState & state, XMLAttrs & xmlAttrs, const Pos & pos)
 {
     if (auto path = std::get_if<SourcePath>(&pos.origin))
-        xmlAttrs["path"] = path->path.abs();
+        xmlAttrs["path"] = state.pathToString(*path);
     xmlAttrs["line"] = fmt("%1%", pos.line);
     xmlAttrs["column"] = fmt("%1%", pos.column);
 }
@@ -88,7 +88,7 @@ static void printValueAsXML(
         break;
 
     case nPath:
-        doc.writeEmptyElement("path", singletonAttrs("value", v.path().to_string()));
+        doc.writeEmptyElement("path", singletonAttrs("value", state.pathToString(v.path())));
         break;
 
     case nNull:

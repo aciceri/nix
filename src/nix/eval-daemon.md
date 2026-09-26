@@ -107,6 +107,15 @@ that cell (`stats.attempts`). A call site whose cell records more than
 100 000 reads (for example because the argument replaces `lib`) is no longer
 traced.
 
+The files of unlocked inputs (the flake being evaluated, or an input
+overridden with `--override-input` to a local tree) keep their identity
+when the tree changes: the daemon mounts such an input at a stable
+virtual store path and converts paths from and to the real store path
+wherever they become strings, so results are those of a cold evaluation.
+A cell that read files of such a tree (by importing, reading, listing,
+testing, copying them or rendering their path) is reused after an edit
+only if those operations give the same results in the new tree.
+
 Unless `--read-only` is given, derivations are written to the store as
 usual; a reused result does not write them again. The daemon keeps every
 path it added as a temporary garbage collector root while it runs, so they

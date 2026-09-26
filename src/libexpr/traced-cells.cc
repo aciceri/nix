@@ -1,5 +1,9 @@
 #include "nix/expr/traced-cells.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/fetchers/fetch-to-store.hh"
+#include "nix/store/content-address.hh"
+#include "nix/util/hash.hh"
+#include "nix/util/mounted-source-accessor.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/finally.hh"
 #include "nix/util/signals.hh"
@@ -216,6 +220,293 @@ void prim_portCall(EvalState & state, CallSite callSite, Value * const * args, V
     }
     call->backing = r;
     call->resolve(state, v);
+}
+
+} // namespace
+
+StableRoot::StableRoot(std::string identity, std::string virtualPrefix, ref<SourceAccessor> target)
+    : identity(std::move(identity))
+    , virtualPrefix(std::move(virtualPrefix))
+    , target(target)
+{
+    displayPrefix.clear();
+}
+
+void StableRoot::anchor() {}
+
+void StableRoot::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
+{
+    target->readFile(path, sink, sizeCallback);
+}
+
+bool StableRoot::pathExists(const CanonPath & path)
+{
+    return target->pathExists(path);
+}
+
+std::optional<SourceAccessor::Stat> StableRoot::maybeLstat(const CanonPath & path)
+{
+    return target->maybeLstat(path);
+}
+
+SourceAccessor::DirEntries StableRoot::readDirectory(const CanonPath & path)
+{
+    return target->readDirectory(path);
+}
+
+std::string StableRoot::readLink(const CanonPath & path)
+{
+    return target->readLink(path);
+}
+
+std::optional<std::filesystem::path> StableRoot::getPhysicalPath(const CanonPath & path)
+{
+    return target->getPhysicalPath(path);
+}
+
+std::pair<CanonPath, std::optional<std::string>> StableRoot::getFingerprint(const CanonPath & path)
+{
+    /* The contents change between generations; the fetcher cache must not
+       remember them under a fingerprint of this accessor. */
+    return {path, std::nullopt};
+}
+
+void StableRoot::invalidateCache()
+{
+    target->invalidateCache();
+}
+
+void StableRoots::mount(
+    EvalState & state, const std::string & identity, const StorePath & storePath, ref<SourceAccessor> accessor)
+{
+    auto real = state.store->printStorePath(storePath);
+
+    StableRoot * root;
+    if (auto i = byIdentity.find(identity); i != byIdentity.end())
+        root = &*i->second;
+    else {
+        auto virtualPath = state.store->makeStorePath(
+            "traced-cells-root", hashString(HashAlgorithm::SHA256, identity), storePath.name());
+        auto r = make_ref<StableRoot>(identity, state.store->printStorePath(virtualPath), accessor);
+        state.storeFS->mount(CanonPath(r->virtualPrefix), r);
+        state.allowPath(virtualPath);
+        byIdentity.emplace(identity, r);
+        byVirtual.emplace(r->virtualPrefix, &*r);
+        root = &*r;
+    }
+
+    if (root->realPrefix != real) {
+        if (!root->realPrefix.empty()) {
+            /* The tree changed: evaluated files may have read anything
+               in it. Parsed files are kept (`parsed`, by content). */
+            byReal.erase(root->realPrefix);
+            auto dir = root->virtualPrefix + "/";
+            state.dropFileCacheUnder(dir);
+            boost::unordered::erase_if(contentHashes, [&](auto & entry) { return entry.first.starts_with(dir); });
+        }
+        root->realPrefix = real;
+        byReal.insert_or_assign(real, root);
+    }
+    root->target = accessor;
+    root->generation = state.getGeneration();
+}
+
+std::string_view StableRoots::storePrefix(std::string_view path) const
+{
+    if (path.size() <= storeDir.size() + 1 || !path.starts_with(storeDir) || path[storeDir.size()] != '/')
+        return {};
+    auto end = path.find('/', storeDir.size() + 1);
+    return path.substr(0, end == path.npos ? path.size() : end);
+}
+
+StableRoot * StableRoots::findVirtual(std::string_view path)
+{
+    if (byVirtual.empty())
+        return nullptr;
+    auto prefix = storePrefix(path);
+    if (prefix.empty())
+        return nullptr;
+    auto i = byVirtual.find(std::string(prefix));
+    return i == byVirtual.end() ? nullptr : i->second;
+}
+
+StableRoot * StableRoots::findReal(std::string_view path)
+{
+    if (byReal.empty())
+        return nullptr;
+    auto prefix = storePrefix(path);
+    if (prefix.empty())
+        return nullptr;
+    auto i = byReal.find(std::string(prefix));
+    return i == byReal.end() ? nullptr : i->second;
+}
+
+std::string contentFingerprint(std::string_view contents)
+{
+    return hashString(HashAlgorithm::SHA256, contents).to_string(HashFormat::Nix32, false);
+}
+
+std::string EvalState::pathToString(const SourcePath & path)
+{
+    auto abs = path.path.abs();
+    if (!stableRoots || &*path.accessor != &*rootFS)
+        return std::string(abs);
+    auto root = stableRoots->findVirtual(abs);
+    if (!root)
+        return std::string(abs);
+    recordFileRead(FileReadKind::Render, SourcePath{rootFS, CanonPath(root->virtualPrefix)}, root->realPrefix);
+    return root->realPrefix + std::string(abs.substr(root->virtualPrefix.size()));
+}
+
+SourcePath EvalState::toRealPath(const SourcePath & path)
+{
+    if (!stableRoots || &*path.accessor != &*rootFS)
+        return path;
+    auto abs = path.path.abs();
+    auto root = stableRoots->findVirtual(abs);
+    if (!root)
+        return path;
+    return {rootFS, CanonPath(root->realPrefix + std::string(abs.substr(root->virtualPrefix.size())))};
+}
+
+bool EvalState::recordsFileReads(const SourcePath & path)
+{
+    return mem.currentOwner && stableRoots && &*path.accessor == &*rootFS && stableRoots->findVirtual(path.path.abs());
+}
+
+void EvalState::recordFileRead(FileReadKind kind, const SourcePath & path, std::string_view fingerprint, Value * filter)
+{
+    if (!mem.currentOwner || !stableRoots || &*path.accessor != &*rootFS)
+        return;
+    auto root = stableRoots->findVirtual(path.path.abs());
+    if (!root)
+        return;
+    auto pathSym = symbols.create(path.path.abs());
+    auto key = (uint64_t(kind) << 32) | pathSym.getId();
+    FileRead read{
+        .root = root,
+        .kind = kind,
+        .path = pathSym,
+        .fingerprint = symbols.create(fingerprint),
+        .checkedAt = symbols.create(root->realPrefix),
+        .filter = filter,
+    };
+    for (auto cell = static_cast<CellInstance *>(mem.currentOwner); cell; cell = cell->parent)
+        if (kind == FileReadKind::Copy || cell->fileReadKeys.insert(key).second)
+            cell->fileReads.push_back(read);
+}
+
+std::string dirFingerprint(const SourceAccessor::DirEntries & entries)
+{
+    std::string res;
+    for (auto & [name, type] : entries) {
+        res += name;
+        res += '\0';
+        res += type ? std::to_string(int(*type)) : "?";
+        res += '\n';
+    }
+    return contentFingerprint(res);
+}
+
+std::string fileReadFingerprint(EvalState & state, const FileRead & read)
+{
+    SourcePath path{state.rootFS, CanonPath(state.symbols[read.path])};
+    std::string_view recorded = state.symbols[read.fingerprint];
+    try {
+        switch (read.kind) {
+
+        case FileReadKind::Import: {
+            auto resolved = resolveExprPath(path);
+            return resolved.path.abs() + "\n" + contentFingerprint(resolved.resolveSymlinks().readFile());
+        }
+
+        case FileReadKind::Resolve: {
+            auto mode = recorded.starts_with("F") ? SymlinkResolution::Full : SymlinkResolution::Ancestors;
+            return std::string(recorded.substr(0, 1)) + "\n" + path.resolveSymlinks(mode).path.abs();
+        }
+
+        case FileReadKind::Content:
+            return contentFingerprint(path.readFile());
+
+        case FileReadKind::Exists:
+            return path.maybeLstat() ? "1" : "0";
+
+        case FileReadKind::ExistsDir: {
+            auto st = path.maybeLstat();
+            return st && st->type == SourceAccessor::tDirectory ? "1" : "0";
+        }
+
+        case FileReadKind::Type: {
+            auto st = path.maybeLstat();
+            return st ? std::to_string(int(st->type)) : "missing";
+        }
+
+        case FileReadKind::Dir:
+            return dirFingerprint(path.readDirectory());
+
+        case FileReadKind::Copy: {
+            /* "<method>\n<name>\n<store path>" */
+            auto nl1 = recorded.find('\n');
+            auto nl2 = recorded.find('\n', nl1 + 1);
+            auto method = ContentAddressMethod::parse(recorded.substr(0, nl1));
+            auto name = recorded.substr(nl1 + 1, nl2 - nl1 - 1);
+            auto real = state.toRealPath(path);
+            std::unique_ptr<PathFilter> filter;
+            if (read.filter)
+                filter = std::make_unique<PathFilter>([&](const std::string & p) {
+                    return state.callPathFilter(read.filter, {real.accessor, CanonPath(p)}, noPos);
+                });
+            auto dst = fetchToStore(
+                state.fetchSettings,
+                *state.store,
+                real.resolveSymlinks(),
+                FetchMode::DryRun,
+                name,
+                method,
+                filter.get());
+            return std::string(recorded.substr(0, nl2 + 1)) + state.store->printStorePath(dst);
+        }
+
+        case FileReadKind::Render:
+            return read.root->realPrefix;
+
+        case FileReadKind::Opaque:
+            return "";
+        }
+    } catch (Interrupted &) {
+        throw;
+    } catch (Error &) {
+        return "error";
+    }
+    unreachable();
+}
+
+namespace {
+
+std::string_view fileReadKindName(FileReadKind kind)
+{
+    switch (kind) {
+    case FileReadKind::Import:
+        return "import";
+    case FileReadKind::Resolve:
+        return "symlink resolution";
+    case FileReadKind::Content:
+        return "contents";
+    case FileReadKind::Exists:
+    case FileReadKind::ExistsDir:
+        return "existence";
+    case FileReadKind::Type:
+        return "type";
+    case FileReadKind::Dir:
+        return "directory listing";
+    case FileReadKind::Copy:
+        return "copy to the store";
+    case FileReadKind::Render:
+        return "store path";
+    case FileReadKind::Opaque:
+        return "unreplayable read";
+    }
+    unreachable();
 }
 
 } // namespace
@@ -573,6 +864,7 @@ bool CellTable::create(EvalState & state, Value & fun, Value & arg, Value & vRes
 {
     auto & lambda = *fun.lambda().fun;
     auto * cell = new CellInstance();
+    cell->parent = static_cast<CellInstance *>(state.mem.currentOwner);
     cell->lambda = &lambda;
     cell->env = fun.lambda().env;
     cell->callSite = callSite;
@@ -796,6 +1088,25 @@ bool CellTable::validate(EvalState & state, CellInstance & cell, Value * rootBac
         }
         return true;
     };
+
+    /* Files of unlocked inputs read while computing the result. Cheap
+       unless the input changed since the read was last checked. */
+    for (auto & read : cell.fileReads) {
+        auto & root = *read.root;
+        if (root.generation != state.getGeneration()) {
+            why = fmt("input '%s' was not mounted in this evaluation", root.identity);
+            return false;
+        }
+        auto real = state.symbols.create(root.realPrefix);
+        if (read.checkedAt == real)
+            continue;
+        auto now = fileReadFingerprint(state, read);
+        if (now != state.symbols[read.fingerprint]) {
+            why = fmt("%s of '%s' changed", fileReadKindName(read.kind), state.symbols[read.path]);
+            return false;
+        }
+        read.checkedAt = real;
+    }
 
     try {
         assign(cell.root, rootBacking);

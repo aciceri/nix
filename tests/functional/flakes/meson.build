@@ -23,6 +23,7 @@ suites += {
     'eval-cache.sh',
     'eval-daemon.sh',
     'eval-daemon-cells.sh',
+    'eval-daemon-roots.sh',
     'search-root.sh',
     'config.sh',
     'show.sh',

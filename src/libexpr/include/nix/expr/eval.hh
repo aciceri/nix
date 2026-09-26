@@ -239,6 +239,8 @@ std::ostream & operator<<(std::ostream & os, WhileTryingToUse w);
 
 struct RegexCache;
 struct CellTable;
+struct StableRoots;
+enum class FileReadKind : uint8_t;
 
 ref<RegexCache> makeRegexCache();
 
@@ -752,6 +754,40 @@ public:
      * speculatively, so errors must not be cached in thunks.
      */
     unsigned int speculative = 0;
+
+    /**
+     * Stable roots for unlocked inputs (see `StableRoot`), enabled
+     * together with traced cells. Null when disabled.
+     */
+    std::unique_ptr<StableRoots> stableRoots;
+
+    /**
+     * The string that a path value denotes: its absolute path, with the
+     * virtual prefix of a stable root replaced by the root's current store
+     * path. Records the dependency on the store path in the current
+     * traced cell.
+     */
+    std::string pathToString(const SourcePath & path);
+
+    /**
+     * `path` with the virtual prefix of a stable root replaced by the
+     * root's current store path, for operations on the store. Does not
+     * record anything.
+     */
+    SourcePath toRealPath(const SourcePath & path);
+
+    /**
+     * Record in the current traced cell (and its enclosing cells) that its
+     * result depends on `fingerprint`, the result of operation `kind` on
+     * `path`, if `path` belongs to a stable root.
+     */
+    void
+    recordFileRead(FileReadKind kind, const SourcePath & path, std::string_view fingerprint, Value * filter = nullptr);
+
+    /**
+     * Whether a file read on `path` would be recorded right now.
+     */
+    bool recordsFileReads(const SourcePath & path);
 
     /**
      * Look up a file in the search path.

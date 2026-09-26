@@ -182,7 +182,15 @@ SourcePath EvalState::realisePath(
                 ensureLazyPathsCopied(context);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
-        return resolveSymlinks ? path.resolveSymlinks(*resolveSymlinks) : path;
+        if (!resolveSymlinks)
+            return path;
+        auto resolved = path.resolveSymlinks(*resolveSymlinks);
+        if (recordsFileReads(path)) [[unlikely]]
+            recordFileRead(
+                FileReadKind::Resolve,
+                path,
+                (*resolveSymlinks == SymlinkResolution::Full ? "F\n" : "A\n") + std::string(resolved.path.abs()));
+        return resolved;
     } catch (Error & e) {
         e.addTrace(nullptr, "while realising the context of path '%s'", path);
         throw;
@@ -296,7 +304,7 @@ static void scopedImport(EvalState & state, SourcePath & path, Value * vScope, V
 static void import(EvalState & state, Value & vPath, Value * vScope, Value & v)
 {
     auto path = state.realisePath(noPos, vPath, std::nullopt);
-    auto path2 = path.path.abs();
+    auto path2 = state.toRealPath(path).path.abs();
 
     // FIXME
     auto isValidDerivationInStore = [&]() -> std::optional<StorePath> {
@@ -756,6 +764,8 @@ struct CompareValues
                 // Note: we don't take the accessor into account
                 // since it's not obvious how to compare them in a
                 // reproducible way.
+                if (state.stableRoots) [[unlikely]]
+                    return state.pathToString(v1->path()) < state.pathToString(v2->path());
                 return v1->pathStrView() < v2->pathStrView();
             case nList:
                 // Lexicographic comparison
@@ -1993,7 +2003,7 @@ static void prim_toPath(EvalState & state, CallSite callSite, Value * const * ar
     NixStringContext context;
     auto path =
         state.coerceToPath(noPos, *args[0], context, "while evaluating the first argument passed to builtins.toPath");
-    v.mkString(path.path.abs(), context, state.mem);
+    v.mkString(state.pathToString(path), context, state.mem);
 }
 
 static RegisterPrimOp primop_toPath({
@@ -2074,6 +2084,8 @@ static void prim_pathExists(EvalState & state, CallSite callSite, Value * const 
 
         auto st = path.maybeLstat();
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
+        if (state.recordsFileReads(path)) [[unlikely]]
+            state.recordFileRead(mustBeDir ? FileReadKind::ExistsDir : FileReadKind::Exists, path, exists ? "1" : "0");
         v.mkBool(exists);
     } catch (RestrictedPathError & e) {
         v.mkBool(false);
@@ -2184,14 +2196,17 @@ static void prim_readFile(EvalState & state, CallSite callSite, Value * const * 
 {
     auto path = state.realisePath(noPos, *args[0]);
     auto s = path.readFile();
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordFileRead(FileReadKind::Content, path, contentFingerprint(s));
     if (s.find((char) 0) != std::string::npos)
         state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
             .atPos(noPos)
             .debugThrow();
     StorePathSet refs;
-    if (state.store->isInStore(path.path.abs())) {
+    auto realPath = state.toRealPath(path);
+    if (state.store->isInStore(realPath.path.abs())) {
         try {
-            refs = state.store->queryPathInfo(state.store->toStorePath(path.path.abs()).first)->references;
+            refs = state.store->queryPathInfo(state.store->toStorePath(realPath.path.abs()).first)->references;
         } catch (Error &) { // FIXME: should be InvalidPathError
         }
         // Re-scan references to filter down to just the ones that actually occur in the file.
@@ -2418,8 +2433,11 @@ static void prim_hashFile(EvalState & state, CallSite callSite, Value * const * 
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(noPos).debugThrow();
 
     auto path = state.realisePath(noPos, *args[1]);
+    auto contents = path.readFile();
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordFileRead(FileReadKind::Content, path, contentFingerprint(contents));
 
-    v.mkString(hashString(*ha, path.readFile()).to_string(HashFormat::Base16, false), state.mem);
+    v.mkString(hashString(*ha, contents).to_string(HashFormat::Base16, false), state.mem);
 }
 
 static RegisterPrimOp primop_hashFile({
@@ -2471,7 +2489,10 @@ static void prim_readFileType(EvalState & state, CallSite callSite, Value * cons
 {
     auto path = state.realisePath(noPos, *args[0], std::nullopt);
     /* Retrieve the directory entry type and stringize it. */
-    v = fileTypeToString(state, path.lstat().type);
+    auto type = path.lstat().type;
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordFileRead(FileReadKind::Type, path, std::to_string(int(type)));
+    v = fileTypeToString(state, type);
 }
 
 static RegisterPrimOp primop_readFileType({
@@ -2493,6 +2514,8 @@ static void prim_readDir(EvalState & state, CallSite callSite, Value * const * a
     // This is similar to `getFileType` but is optimized to reduce system calls
     // on many systems.
     auto entries = path.readDirectory();
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordFileRead(FileReadKind::Dir, path, dirFingerprint(entries));
     auto attrs = state.buildBindings(entries.size());
 
     // If we hit unknown directory entry types we may need to fallback to
@@ -2891,7 +2914,7 @@ bool EvalState::callPathFilter(Value * filterFun, const SourcePath & path, PosId
     /* Call the filter function.  The first argument is the path, the
        second is a string indicating the type of the file. */
     Value arg1;
-    arg1.mkString(path.path.abs(), mem);
+    arg1.mkString(pathToString(path), mem);
 
     // assert that type is not "unknown"
     Value res;
@@ -2910,6 +2933,12 @@ static void addPath(
     Value & v,
     const NixStringContext & context)
 {
+    /* Copy from the current store path of a stable root (see
+       `copyPathToStore()`); the filter then sees the same paths as in a
+       cold evaluation. */
+    auto stablePath = path;
+    path = state.toRealPath(path);
+
     try {
         StorePathSet refs;
 
@@ -2960,9 +2989,21 @@ static void addPath(
                 state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
                     .atPos(noPos)
                     .debugThrow();
+            if (state.recordsFileReads(stablePath)) [[unlikely]] {
+                if (refs.empty())
+                    state.recordFileRead(
+                        FileReadKind::Copy,
+                        stablePath,
+                        fmt("%s\n%s\n%s", method.render(), name, state.store->printStorePath(dstPath)),
+                        filterFun);
+                else
+                    state.recordFileRead(FileReadKind::Opaque, stablePath, "");
+            }
             state.allowAndSetStorePathString(dstPath, v);
-        } else
+        } else {
+            /* The result depends only on the expected hash. */
             state.allowAndSetStorePathString(*expectedStorePath, v);
+        }
     } catch (Error & e) {
         e.addTrace(nullptr, "while adding path '%s'", path);
         throw;

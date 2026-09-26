@@ -601,3 +601,67 @@ Known gaps: a nested instance could be rebound to a different logical call
 that has the same ordinal and observationally equivalent arguments; positions of proxy
 attributes in error messages may be stale; `builtins.trace` output can
 appear during replay.
+
+## 13. Generic memoisation, phase 1: stable roots (implemented)
+
+Goal of the generic track: memoisation that works for arbitrary code, with
+no list of files and no knowledge of Nixpkgs, NixOS or the flake. Phases:
+(1) file identity that survives edits to a tree, (2) structural reads of
+values of other cells with early cutoff instead of identity summaries,
+(3) cell sites chosen by measured cost among all function applications,
+(4) persistence.
+
+Phase 1 implements section 8.3 with exact equivalence to a cold
+evaluation:
+
+- **Stable roots.** Every input mounted from an *unlocked* reference (the
+  flake being evaluated, `--override-input` pointing to a local tree) is
+  also mounted at a virtual store path derived from the reference
+  (`StableRoot`, `StableRoots::mount()`, called by `mountInput()`); the
+  mount forwards to the contents of the current request. Locked inputs
+  keep their store path, which is already stable. Unlocked inputs are
+  mounted while locking, at the start of a request, before any cell is
+  looked up; a cell that read files of a root not mounted in the current
+  request is rejected.
+- **Conversions.** Every string that names a file of the current tree
+  becomes a path under the virtual root (`EvalState::rootPath()`, where
+  strings become paths). Every place where a path becomes a string renders
+  the current store path instead (`EvalState::pathToString()`):
+  `toString` and interpolation without copy, `builtins.toPath`, positions
+  (`__curPos`, `unsafeGetAttrPos`), the path argument of source filters,
+  JSON and XML output, ordering of paths. Store operations use the real
+  path (`EvalState::toRealPath()`): copies to the store (so the
+  source-to-store cache stays keyed by content), store queries in
+  `readFile` and `import`. Results are those of a cold evaluation;
+  `--verify` checks it.
+- **Files keep their expressions.** Parsed files of stable roots are kept
+  by path and content hash (`StableRoots::parsed`), so an unchanged file
+  keeps its lambdas (cell keys) and positions when its tree changes.
+  Evaluated files of a changed root are dropped.
+- **File reads in traces.** Operations on files of stable roots made in a
+  cell's context are recorded as "operation on the path as written =
+  fingerprint of the result" (`FileReadKind`: import, symlink resolution,
+  contents, existence, type, directory listing, copy to the store with the
+  filter function if any, rendered store path) in the cell and all
+  enclosing cells (`CellInstance::parent`). Validation replays them on the
+  current tree, skipping roots whose store path did not change since the
+  read was last checked. Recording happens at the level of language
+  operations, not in the accessor: the evaluator caches `lstat`, imported
+  files and store copies within a request, so a second cell reading the
+  same file would not reach the accessor.
+
+Measured (functional test `eval-daemon-roots.sh`): after an edit to a file
+the cell did not read, the cell is reused although the tree has a new
+store path; edits to imported, read, listed, tested, copied files, and any
+edit after a path was rendered, invalidate it; a filtered copy survives
+changes to files the filter excludes. On `universe` all drvPaths stay
+identical and the steady state is unchanged (paired cold/daemon 3.5-4x,
+as before); memory is stable over distinct edits.
+
+Not yet useful for a local Nixpkgs checkout (`nixpkgs-edit.py`): results
+are correct, but after any edit 27 of 72 cells are recomputed. The
+`outputs` of the overridden Nixpkgs flake read `self.lastModified` and
+`narHash`, which change with every edit of a dirty tree (the NixOS version
+string really depends on them), and every flake that uses `nixpkgs.lib`
+compares it by identity with the recomputed one. Removing that cascade is
+phase 2.
