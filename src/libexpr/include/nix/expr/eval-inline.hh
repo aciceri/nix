@@ -66,6 +66,13 @@ Env & EvalMemory::allocEnv(size_t size)
 
     Env * env;
 
+    if (trackOwners) [[unlikely]] {
+        /* The owner goes in the word before the environment (see `ownerOf()`). */
+        auto p = (char *) allocBytes(sizeof(void *) + sizeof(Env) + size * sizeof(Value *));
+        ((void **) p)[0] = currentOwner;
+        return *(Env *) (p + sizeof(void *));
+    }
+
 #if NIX_USE_BOEHMGC
     if (size == 1) {
         /* Allocation cache for size-1 Env objects. Boehm GC is already a global resource, so thread_local is
@@ -95,6 +102,8 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
+    if (mem.trackOwners) [[unlikely]]
+        return forceValueTracked(v, pos);
     if (v.isThunk()) {
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());

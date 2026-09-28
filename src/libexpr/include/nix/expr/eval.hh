@@ -23,6 +23,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
+#include <nlohmann/json_fwd.hpp>
 
 #include <map>
 #include <optional>
@@ -229,6 +230,23 @@ struct WhileTryingToUse
 std::ostream & operator<<(std::ostream & os, WhileTryingToUse w);
 
 struct RegexCache;
+struct CellTable;
+struct StableRoots;
+struct CellInstance;
+
+/**
+ * What `EvalMemory::currentOwner`, `Bindings::owner` and the owner of an
+ * `Env` (`EvalMemory::ownerOf()`) point to: a traced cell, either
+ * computing (`CellInstance::self`) or inside a call through one of its
+ * ports (`CellInstance::inCall`). The `inCall` owners are only reachable
+ * through a registered displacement into `CellInstance`.
+ */
+struct CellOwner
+{
+    CellInstance * cell = nullptr;
+    bool inCall = false;
+};
+enum class FileReadKind : uint8_t;
 
 ref<RegexCache> makeRegexCache();
 
@@ -356,7 +374,12 @@ public:
         Counter nrListElems;
     };
 
-    EvalMemory();
+    /**
+     * With `trackOwners`, every `Env` records the `currentOwner` it was
+     * allocated under (see `ownerOf()`). Off by default: it costs a word
+     * per environment and a branch per forced value.
+     */
+    explicit EvalMemory(bool trackOwners = false);
 
     EvalMemory(const EvalMemory &) = delete;
     EvalMemory(EvalMemory &&) = delete;
@@ -366,6 +389,33 @@ public:
     inline void * allocBytes(size_t n);
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
+
+    /**
+     * See the constructor.
+     */
+    const bool trackOwners;
+
+    /**
+     * The context of the evaluation in progress (a traced cell's
+     * `CellInstance`, or null for ordinary evaluation), recorded in every
+     * new `Env` when `trackOwners` is set: forcing a thunk runs in the
+     * context of its environment, so a thunk created while computing a
+     * traced cell's result keeps the cell's context when forced later
+     * from elsewhere. Applications created by primops in a cell's context
+     * are thunks too (`EvalState::mkLazyApp()`); a `tApp` runs in the
+     * context of its lambda. Traced cells use it to tell calls made for a
+     * cell apart from calls made by ordinary evaluation.
+     */
+    void * currentOwner = nullptr;
+
+    /**
+     * The `currentOwner` at the time `env` was allocated, stored in the
+     * word before it; null unless `trackOwners` is set.
+     */
+    void * ownerOf(const Env & env) const
+    {
+        return trackOwners ? ((void * const *) &env)[-1] : nullptr;
+    }
 
     Bindings * allocBindings(size_t capacity);
 
@@ -516,6 +566,11 @@ private:
         fileEvalCache;
 
     /**
+     * See `startGeneration()`.
+     */
+    uint64_t generation = 0;
+
+    /**
      * Associate source positions of certain AST nodes with their preceding doc comment, if they have one.
      * Grouped by file.
      */
@@ -655,7 +710,141 @@ public:
      */
     void evalFile(const SourcePath & path, Value & v, bool mustBeTrivial = false);
 
-    void resetFileCache();
+    /**
+     * Drop the cached files and, unless `keepCells` is set, every traced
+     * cell.
+     */
+    void resetFileCache(bool keepCells = false);
+
+    /**
+     * `v.mkApp(fun, arg)`, but as a thunk that keeps the current context
+     * when that is a traced cell's (see `EvalMemory::currentOwner`).
+     */
+    void mkLazyApp(Value & v, Value * fun, Value * arg)
+    {
+        if (!mem.currentOwner) {
+            v.mkApp(fun, arg);
+            return;
+        }
+        Env & env = mem.allocEnv(2);
+        env.values[0] = fun;
+        env.values[1] = arg;
+        v.mkThunk(&env, &eLazyApp);
+    }
+
+    /**
+     * Start a new evaluation in a long-lived `EvalState` (for example
+     * `nix eval-daemon`). Drops the per-evaluation caches (fetched inputs,
+     * Git work tree info, lookup path resolution, filesystem metadata) so
+     * that changed inputs are fetched and hashed again, and the cached files
+     * of per-input accessors, which cannot be hit again. Keeps the parsed
+     * and evaluated files under the root filesystem (including the store)
+     * and the built-in accessors in `fileEvalCache`.
+     *
+     * Keeping evaluated files is sound only under pure evaluation: every
+     * file is then read from a store path or from an input mounted at a
+     * store path computed from its NAR hash (`mountInput()`), so a cached
+     * path always denotes the same contents, and forced thunks inside a
+     * cached file value cannot have read anything mutable.
+     */
+    void startGeneration();
+
+    /**
+     * Number of evaluations started with `startGeneration()`.
+     */
+    uint64_t getGeneration() const
+    {
+        return generation;
+    }
+
+    size_t fileEvalCacheSize() const;
+
+    /**
+     * Drop the evaluated files whose path is under `dir` (with a trailing
+     * slash), for example an earlier copy of a flake being edited.
+     */
+    void dropFileCacheUnder(std::string_view dir);
+
+    /**
+     * Drop the evaluated file at `path` (an absolute path in `rootFS`).
+     */
+    void dropFileCacheEntry(std::string_view path);
+
+    /**
+     * Drop the resolutions of imports of paths under `dir`.
+     */
+    void dropImportResolutionUnder(std::string_view dir);
+
+    /**
+     * Traced cells (doc/traced-cells/DESIGN.md), only in a long-lived
+     * `EvalState` that calls `startGeneration()`. Null when disabled.
+     */
+    std::unique_ptr<CellTable> cells;
+
+    /**
+     * Make applications of `import nixpkgs { ... }` and of the `outputs`
+     * of flakes traced cells (see `CellTable::registerFile()`). Requires
+     * the Boehm GC.
+     */
+    void enableCells();
+
+    /**
+     * Nonzero while traced cells are being validated: values are forced
+     * speculatively, so errors must not be cached in thunks.
+     */
+    unsigned int speculative = 0;
+
+    /**
+     * Stable roots for unlocked inputs (see `StableRoot`), enabled
+     * together with traced cells. Null when disabled.
+     */
+    std::unique_ptr<StableRoots> stableRoots;
+
+    /**
+     * Replace the virtual prefixes of stable roots in `s` by the store
+     * paths of their current contents: called where a string leaves the
+     * evaluator (derivations, files written to the store, hashes, the
+     * output). Records a Render read for each root found unless `record`
+     * is false (a log message: the value does not depend on the store
+     * path, only its rendering does); with `context`, also
+     * `realizeContext()`. Returns whether `s` changed.
+     */
+    bool realizeStrings(std::string & s, NixStringContext * context = nullptr, bool record = true);
+
+    /**
+     * Replace the virtual store paths of stable roots in `context` (the
+     * `outPath` of an unlocked input carries one) by the store paths of
+     * their current contents, recording a Render read for each. Does not
+     * copy anything to the store (see `ensureLazyPathsCopied()`).
+     */
+    bool realizeContext(NixStringContext & context);
+
+    /**
+     * `path` with the virtual prefix of a stable root replaced by the
+     * root's current store path, for operations on the store. Does not
+     * record anything.
+     */
+    SourcePath toRealPath(const SourcePath & path);
+
+    /**
+     * Record in the current traced cell (and its enclosing cells) that its
+     * result depends on `fingerprint`, the result of operation `kind` on
+     * `path`, if `path` belongs to a stable root.
+     */
+    void
+    recordFileRead(FileReadKind kind, const SourcePath & path, std::string_view fingerprint, Value * filter = nullptr);
+
+    /**
+     * Whether a file read on `path` would be recorded right now.
+     */
+    bool recordsFileReads(const SourcePath & path);
+
+    /**
+     * Record an `Import` read of `path`, resolved to `resolvedPath`
+     * (`resolveExprPath()`): the file's contents and the version of its
+     * value. Requires `recordsFileReads(path)`.
+     */
+    void recordImport(const SourcePath & path, const SourcePath & resolvedPath);
 
     /**
      * Look up a file in the search path.
@@ -704,6 +893,13 @@ private:
      * This code is factored out so that it's not in the heavily inlined hot path.
      */
     void handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, const PosIdx pos);
+
+    /**
+     * `forceValue()` when `EvalMemory::trackOwners` is set: the same, run
+     * in the context of the thunk's environment or of the applied
+     * lambda's closure (see `EvalMemory::currentOwner`).
+     */
+    void forceValueTracked(Value & v, const PosIdx pos);
 
     /**
      * Internal support function for forceValue
@@ -915,9 +1111,15 @@ public:
      */
     std::vector<std::pair<std::string, Constant>> constantInfos;
 
-private:
+public:
 
+    /**
+     * Number of values in `baseEnv` (`ExprParseFile` copies them for files
+     * of stable roots, see `StableRoots::fileCells`).
+     */
     unsigned int baseEnvDispl = 0;
+
+private:
 
     void createBaseEnv(const EvalSettings & settings);
 
@@ -1106,6 +1308,11 @@ public:
     void printStatistics();
 
     /**
+     * The statistics printed by `printStatistics()`, as JSON.
+     */
+    nlohmann::json getStatistics();
+
+    /**
      * Perform a full memory garbage collection - not incremental.
      *
      * @return true if Nix was built with GC and a GC was performed, false if not.
@@ -1192,6 +1399,7 @@ private:
 
     friend struct ExprOpUpdate;
     friend struct ExprOpConcatLists;
+    friend struct CellTable;
     friend struct ExprVar;
     friend struct ExprString;
     friend struct ExprInt;

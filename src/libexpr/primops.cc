@@ -4,6 +4,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/traced-cells.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/static-string-data.hh"
@@ -181,7 +182,15 @@ SourcePath EvalState::realisePath(
                 ensureLazyPathsCopied(context);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
-        return resolveSymlinks ? path.resolveSymlinks(*resolveSymlinks) : path;
+        if (!resolveSymlinks)
+            return path;
+        auto resolved = path.resolveSymlinks(*resolveSymlinks);
+        if (recordsFileReads(path)) [[unlikely]]
+            recordFileRead(
+                FileReadKind::Resolve,
+                path,
+                (*resolveSymlinks == SymlinkResolution::Full ? "F\n" : "A\n") + std::string(resolved.path.abs()));
+        return resolved;
     } catch (Error & e) {
         e.addTrace(nullptr, "while realising the context of path '%s'", path);
         throw;
@@ -285,7 +294,10 @@ static void scopedImport(EvalState & state, SourcePath & path, Value * vScope, V
     // args[0]->attrs is already sorted.
 
     printTalkative("evaluating file '%1%'", path);
-    Expr * e = state.parseExprFromFile(resolveExprPath(path), staticEnv);
+    auto resolvedPath = resolveExprPath(path);
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordImport(path, resolvedPath);
+    Expr * e = state.parseExprFromFile(resolvedPath, staticEnv);
 
     e->eval(state, *env, v);
 }
@@ -1318,9 +1330,18 @@ static RegisterPrimOp primop_deepSeq({
 static void prim_trace(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceValue(*args[0], noPos);
-    if (args[0]->type() == nString)
-        printError("trace: %1%", args[0]->string_view());
-    else
+    if (args[0]->type() == nString) {
+        auto text = args[0]->string_view();
+        /* Paths of stable roots are virtual in strings; the log is a
+           boundary. */
+        std::string realized;
+        if (state.stableRoots) [[unlikely]] {
+            realized = text;
+            if (state.realizeStrings(realized, nullptr, false))
+                text = realized;
+        }
+        printError("trace: %1%", text);
+    } else
         printError("trace: %1%", ValuePrinter(state, *args[0]));
     if (state.settings.builtinsTraceDebugger) {
         state.runDebugRepl(nullptr);
@@ -1352,6 +1373,12 @@ static void prim_warn(EvalState & state, CallSite callSite, Value * const * args
     // By rejecting non-strings we allow future versions to add more features without breaking existing code.
     auto msgStr =
         state.forceString(*args[0], noPos, "while evaluating the first argument; the message passed to builtins.warn");
+    std::string realized;
+    if (state.stableRoots) [[unlikely]] {
+        realized = msgStr;
+        if (state.realizeStrings(realized, nullptr, false))
+            msgStr = realized;
+    }
 
     {
         ErrorInfo info{
@@ -1439,6 +1466,14 @@ static void prim_derivationStrict(EvalState & state, CallSite callSite, Value * 
     } catch (Error & e) {
         e.addTrace(state.positions[nameAttr->pos], "while evaluating the derivation attribute 'name'");
         throw;
+    }
+    /* A name derived from a rendered path of a stable root (`baseNameOf
+       (toString src)`) carries a virtual hash: realize it. */
+    std::string realName;
+    if (state.stableRoots) [[unlikely]] {
+        realName = drvName;
+        if (state.realizeStrings(realName))
+            drvName = realName;
     }
 
     try {
@@ -1780,6 +1815,21 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         drv.structuredAttrs = std::move(*jsonObject);
     }
 
+    /* Paths of stable roots (`nix eval-daemon`) are virtual in strings
+       until they leave the evaluator: here. */
+    if (state.stableRoots) [[unlikely]] {
+        state.realizeStrings(drv.builder, &context);
+        for (auto & arg : drv.args)
+            state.realizeStrings(arg, &context);
+        for (auto & [name, value] : drv.env)
+            state.realizeStrings(value, &context);
+        if (drv.structuredAttrs) {
+            auto dumped = nlohmann::json(drv.structuredAttrs->structuredAttrs).dump();
+            if (state.realizeStrings(dumped, &context))
+                drv.structuredAttrs->structuredAttrs = nlohmann::json::parse(dumped).get<nlohmann::json::object_t>();
+        }
+    }
+
     /* Everything in the context of the strings in the derivation
        attributes should be added as dependencies of the resulting
        derivation. */
@@ -2073,6 +2123,8 @@ static void prim_pathExists(EvalState & state, CallSite callSite, Value * const 
 
         auto st = path.maybeLstat();
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
+        if (state.recordsFileReads(path)) [[unlikely]]
+            state.recordFileRead(mustBeDir ? FileReadKind::ExistsDir : FileReadKind::Exists, path, exists ? "1" : "0");
         v.mkBool(exists);
     } catch (RestrictedPathError & e) {
         v.mkBool(false);
@@ -2183,12 +2235,17 @@ static void prim_readFile(EvalState & state, CallSite callSite, Value * const * 
 {
     auto path = state.realisePath(noPos, *args[0]);
     auto s = path.readFile();
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordFileRead(FileReadKind::Content, path, contentFingerprint(s));
     if (s.find((char) 0) != std::string::npos)
         state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
             .atPos(noPos)
             .debugThrow();
     StorePathSet refs;
     if (state.store->isInStore(path.path.abs())) {
+        /* A file of a stable root belongs to the root's current store path. */
+        if (state.stableRoots) [[unlikely]]
+            path = state.toRealPath(path);
         try {
             refs = state.store->queryPathInfo(state.store->toStorePath(path.path.abs()).first)->references;
         } catch (Error &) { // FIXME: should be InvalidPathError
@@ -2417,8 +2474,11 @@ static void prim_hashFile(EvalState & state, CallSite callSite, Value * const * 
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(noPos).debugThrow();
 
     auto path = state.realisePath(noPos, *args[1]);
+    auto contents = path.readFile();
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordFileRead(FileReadKind::Content, path, contentFingerprint(contents));
 
-    v.mkString(hashString(*ha, path.readFile()).to_string(HashFormat::Base16, false), state.mem);
+    v.mkString(hashString(*ha, contents).to_string(HashFormat::Base16, false), state.mem);
 }
 
 static RegisterPrimOp primop_hashFile({
@@ -2470,7 +2530,10 @@ static void prim_readFileType(EvalState & state, CallSite callSite, Value * cons
 {
     auto path = state.realisePath(noPos, *args[0], std::nullopt);
     /* Retrieve the directory entry type and stringize it. */
-    v = fileTypeToString(state, path.lstat().type);
+    auto type = path.lstat().type;
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordFileRead(FileReadKind::Type, path, std::to_string(int(type)));
+    v = fileTypeToString(state, type);
 }
 
 static RegisterPrimOp primop_readFileType({
@@ -2492,6 +2555,8 @@ static void prim_readDir(EvalState & state, CallSite callSite, Value * const * a
     // This is similar to `getFileType` but is optimized to reduce system calls
     // on many systems.
     auto entries = path.readDirectory();
+    if (state.recordsFileReads(path)) [[unlikely]]
+        state.recordFileRead(FileReadKind::Dir, path, dirFingerprint(entries));
     auto attrs = state.buildBindings(entries.size());
 
     // If we hit unknown directory entry types we may need to fallback to
@@ -2763,6 +2828,16 @@ static void prim_toFile(EvalState & state, CallSite callSite, Value * const * ar
     auto contents =
         state.forceString(*args[1], context, noPos, "while evaluating the second argument passed to builtins.toFile");
 
+    std::string realized, realName;
+    if (state.stableRoots) [[unlikely]] {
+        realized = contents;
+        if (state.realizeStrings(realized, &context))
+            contents = realized;
+        realName = name;
+        if (state.realizeStrings(realName))
+            name = realName;
+    }
+
     StorePathSet refs;
 
     for (auto c : context) {
@@ -2909,6 +2984,22 @@ static void addPath(
     Value & v,
     const NixStringContext & context)
 {
+    /* A path of a stable root is copied from the store path of its current
+       contents (see `copyPathToStore()`), but the filter still sees the
+       virtual paths, like every other string of the tree. A name derived
+       from a rendered path carries a virtual hash. */
+    std::optional<SourcePath> stablePath;
+    std::string realName;
+    if (state.stableRoots) [[unlikely]] {
+        if (auto real = state.toRealPath(path); real != path) {
+            stablePath = std::move(path);
+            path = std::move(real);
+        }
+        realName = name;
+        if (state.realizeStrings(realName))
+            name = realName;
+    }
+
     try {
         StorePathSet refs;
 
@@ -2928,6 +3019,8 @@ static void addPath(
         if (filterFun)
             filter = std::make_unique<PathFilter>([&](const std::string & p) {
                 auto p2 = CanonPath(p);
+                if (stablePath && p.starts_with(path.path.abs())) [[unlikely]]
+                    p2 = CanonPath(stablePath->path.abs() + p.substr(path.path.abs().size()));
                 return state.callPathFilter(filterFun, {path.accessor, p2}, noPos);
             });
 
@@ -2959,6 +3052,16 @@ static void addPath(
                 state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
                     .atPos(noPos)
                     .debugThrow();
+            if (stablePath && state.recordsFileReads(*stablePath)) [[unlikely]] {
+                if (refs.empty())
+                    state.recordFileRead(
+                        FileReadKind::Copy,
+                        *stablePath,
+                        fmt("%s\n%s\n%s", method.render(), name, state.store->printStorePath(dstPath)),
+                        filterFun);
+                else
+                    state.recordFileRead(FileReadKind::Opaque, *stablePath, "");
+            }
             state.allowAndSetStorePathString(dstPath, v);
         } else
             state.allowAndSetStorePathString(*expectedStorePath, v);
@@ -3222,9 +3325,13 @@ static void prim_unsafeGetAttrPos(EvalState & state, CallSite callSite, Value * 
     auto attr = state.forceStringNoCtx(
         *args[0], noPos, "while evaluating the first argument passed to builtins.unsafeGetAttrPos");
     state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.unsafeGetAttrPos");
-    auto i = args[1]->attrs()->get(state.symbols.create(attr));
+    auto name = state.symbols.create(attr);
+    auto i = args[1]->attrs()->get(name);
     if (!i)
         v.mkNull();
+    else if (auto pos = state.cells ? state.cells->attrPos(args[1]->attrs(), name) : std::nullopt)
+        /* A traced-cell proxy: report (and record) the current position. */
+        state.mkPos(v, *pos);
     else
         state.mkPos(v, i->pos);
 }
@@ -3582,14 +3689,22 @@ static RegisterPrimOp primop_catAttrs({
 static void prim_functionArgs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceValue(*args[0], noPos);
-    if (args[0]->isPrimOpApp() || args[0]->isPrimOp()) {
+    Value * fn = args[0];
+    /* Look through traced-cell proxies to the function they denote. */
+    while (state.cells)
+        if (auto backing = state.cells->observeFunctionArgs(state, *fn)) {
+            state.forceValue(*backing, noPos);
+            fn = backing;
+        } else
+            break;
+    if (fn->isPrimOpApp() || fn->isPrimOp()) {
         v.mkAttrs(&Bindings::emptyBindings);
         return;
     }
-    if (!args[0]->isLambda())
+    if (!fn->isLambda())
         state.error<TypeError>("'functionArgs' requires a function").atPos(noPos).debugThrow();
 
-    if (const auto & formals = args[0]->lambda().fun->getFormals()) {
+    if (const auto & formals = fn->lambda().fun->getFormals()) {
         auto attrs = state.buildBindings(formals->formals.size());
         for (auto & i : formals->formals)
             attrs.insert(i.name, state.getBool(i.def), i.pos);
@@ -3634,8 +3749,8 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
     for (auto & i : *args[1]->attrs()) {
         Value * vName = Value::toPtr(state.symbols[i.name]);
         Value * vFun2 = state.allocValue();
-        vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+        state.mkLazyApp(*vFun2, args[0], vName);
+        state.mkLazyApp(attrs.alloc(i.name), vFun2, i.value);
     }
 
     v.mkAttrs(attrs.alreadySorted());
@@ -3704,11 +3819,11 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
     for (auto & [sym, elem] : attrsSeen) {
         auto name = Value::toPtr(state.symbols[sym]);
         auto call1 = state.allocValue();
-        call1->mkApp(args[0], name);
+        state.mkLazyApp(*call1, args[0], name);
         auto call2 = state.allocValue();
         auto arg = state.allocValue();
         arg->mkList(*elem.list);
-        call2->mkApp(call1, arg);
+        state.mkLazyApp(*call2, call1, arg);
         attrs.insert(sym, call2);
     }
 
@@ -3862,7 +3977,7 @@ static void prim_map(EvalState & state, CallSite callSite, Value * const * args,
 
     auto list = state.buildList(args[1]->listSize());
     for (const auto & [n, v] : enumerate(list))
-        (v = state.allocValue())->mkApp(args[0], args[1]->listView()[n]);
+        state.mkLazyApp(*(v = state.allocValue()), args[0], args[1]->listView()[n]);
     v.mkList(list);
 }
 
@@ -4137,7 +4252,7 @@ static void prim_genList(EvalState & state, CallSite callSite, Value * const * a
     for (const auto & [n, v] : enumerate(list)) {
         auto arg = state.allocValue();
         arg->mkInt(n);
-        (v = state.allocValue())->mkApp(args[0], arg);
+        state.mkLazyApp(*(v = state.allocValue()), args[0], arg);
     }
     v.mkList(list);
 }
@@ -4771,6 +4886,13 @@ static void prim_hashString(EvalState & state, CallSite callSite, Value * const 
     auto s = state.forceString(
         *args[1], context, noPos, "while evaluating the second argument passed to builtins.hashString");
 
+    if (state.stableRoots) [[unlikely]] {
+        std::string real(s);
+        if (state.realizeStrings(real)) {
+            v.mkString(hashString(*ha, real).to_string(HashFormat::Base16, false), state.mem);
+            return;
+        }
+    }
     v.mkString(hashString(*ha, s).to_string(HashFormat::Base16, false), state.mem);
 }
 

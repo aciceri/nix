@@ -101,6 +101,13 @@ public:
 
     std::vector<PrimOp> extraPrimOps;
 
+    /**
+     * Whether the evaluator tracks the traced cell that allocated each
+     * environment (`EvalMemory::trackOwners`). Not a setting: set by `nix
+     * eval-daemon` before the `EvalState` is created.
+     */
+    bool traceCells = false;
+
     Setting<bool> enableNativeCode{this, false, "allow-unsafe-native-code-during-evaluation", R"(
         Enable built-in functions that allow executing native code.
 

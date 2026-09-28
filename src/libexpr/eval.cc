@@ -1,4 +1,5 @@
 #include "nix/expr/eval.hh"
+#include "nix/expr/traced-cells.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/primops.hh"
@@ -236,9 +237,21 @@ static Symbol getName(const AttrName & name, EvalState & state, Env & env)
 
 static constexpr size_t BASE_ENV_SIZE = 128;
 
-EvalMemory::EvalMemory()
+EvalMemory::EvalMemory(bool trackOwners)
+    : trackOwners(trackOwners)
 {
     assertGCInitialized();
+#if NIX_USE_BOEHMGC
+    /* With `trackOwners` an `Env` starts one word into its allocation (see
+       `allocEnv()`), and values point to it with their tag bits added (see
+       the displacements registered by `initGC()`). */
+    if (trackOwners) {
+        GC_register_displacement(sizeof(void *));
+        if constexpr (detail::useBitPackedValueStorage<sizeof(void *)>)
+            for (std::size_t i = 1; i < sizeof(std::uintptr_t); ++i)
+                GC_register_displacement(sizeof(void *) + i);
+    }
+#endif
 }
 
 EvalState::EvalState(
@@ -250,6 +263,7 @@ EvalState::EvalState(
     : fetchSettings{fetchSettings}
     , settings{settings}
     , symbols(StaticEvalSymbols::staticSymbolTable())
+    , mem(settings.traceCells)
     , repair(NoRepair)
     , storeFS(makeMountedSourceAccessor({
           {CanonPath::root, makeEmptySourceAccessor()},
@@ -1133,6 +1147,26 @@ struct ExprParseFile : Expr, gc
     {
         printTalkative("evaluating file '%s'", path);
 
+        /* Files of stable roots are evaluated in the context of a file
+           cell that collects their reads (see `StableRoots::fileCells`). */
+        auto savedOwner = state.mem.currentOwner;
+        Finally restoreOwner([&]() { state.mem.currentOwner = savedOwner; });
+        Env * fileEnv = &state.baseEnv;
+        if (state.stableRoots && &*path.accessor == &*state.rootFS) [[unlikely]]
+            if (state.stableRoots->findVirtual(path.path.abs())) {
+                auto fileCell = new CellInstance();
+                state.stableRoots->fileCells.insert_or_assign(std::string(path.path.abs()), fileCell);
+                state.mem.currentOwner = &fileCell->self;
+                /* Thunks of the file's top-level expression (an attribute
+                   set, a list) live in the environment it is evaluated in;
+                   a copy of the base environment owned by the file cell
+                   makes their reads the file's when they are forced later
+                   (same layout, so static displacements hold). */
+                fileEnv = &state.mem.allocEnv(state.baseEnvDispl);
+                fileEnv->up = state.baseEnv.up;
+                std::copy_n(state.baseEnv.values, state.baseEnvDispl, fileEnv->values);
+            }
+
         auto e = state.parseExprFromFile(path);
 
         try {
@@ -1147,7 +1181,10 @@ struct ExprParseFile : Expr, gc
             if (mustBeTrivial && !(dynamic_cast<ExprAttrs *>(e)))
                 state.error<EvalError>("file '%s' must be an attribute set", path).debugThrow();
 
-            state.eval(e, v);
+            e->eval(state, *fileEnv, v);
+
+            if (state.cells)
+                state.cells->registerFile(state, path, e, v);
         } catch (Error & e) {
             state.addErrorTrace(e, "while evaluating the file '%s':", path.to_string());
             throw;
@@ -1157,6 +1194,19 @@ struct ExprParseFile : Expr, gc
 
 } // namespace
 
+void EvalState::recordImport(const SourcePath & path, const SourcePath & resolvedPath)
+{
+    auto abs = std::string(resolvedPath.path.abs());
+    auto hash = stableRoots->contentHashes.find(abs);
+    recordFileRead(
+        FileReadKind::Import,
+        path,
+        abs + "\n"
+            + (hash != stableRoots->contentHashes.end() ? hash->second
+                                                        : contentFingerprint(resolvedPath.resolveSymlinks().readFile()))
+            + "\n" + std::to_string(stableRoots->fileVersion(abs)));
+}
+
 void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
 {
     auto resolvedPath = getConcurrent(*importResolutionCache, path);
@@ -1165,6 +1215,9 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         resolvedPath = resolveExprPath(path);
         importResolutionCache->emplace(path, *resolvedPath);
     }
+
+    if (recordsFileReads(path)) [[unlikely]]
+        recordImport(path, *resolvedPath);
 
     if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
         forceValue(**v2, noPos);
@@ -1194,13 +1247,88 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     v = *vExpr;
 }
 
-void EvalState::resetFileCache()
+void EvalState::resetFileCache(bool keepCells)
 {
     importResolutionCache->clear();
     fileEvalCache->clear();
     inputCache->clear();
     lookupPathResolved->clear();
     rootFS->invalidateCache();
+    if (cells && !keepCells)
+        cells->clear();
+    /* Files are evaluated again into values other than those importers
+       hold: those importers must not be found valid. */
+    if (stableRoots) {
+        for (auto & [path, cell] : stableRoots->fileCells)
+            stableRoots->fileVersions[path]++;
+        stableRoots->fileCells.clear();
+    }
+}
+
+void EvalState::startGeneration()
+{
+    inputCache->clear();
+    lookupPathResolved->clear();
+    rootFS->invalidateCache();
+
+    /* Clearing `inputCache` means that inputs get new accessors from now
+       on, so entries keyed by any accessor other than the long-lived ones
+       can never be hit again (for example `flake.nix` parsed from the Git
+       work tree before mounting, see `getFlake()`). */
+    auto isLongLived = [&](const SourcePath & path) {
+        auto * accessor = &*path.accessor;
+        return accessor == &*rootFS || accessor == &*corepkgsFS || accessor == &*internalFS;
+    };
+    fileEvalCache->erase_if([&](auto & entry) { return !isLongLived(entry.first); });
+    importResolutionCache->erase_if(
+        [&](auto & entry) { return !isLongLived(entry.first) || !isLongLived(entry.second); });
+
+    if (cells)
+        cells->startGeneration(*this);
+
+    generation++;
+}
+
+void EvalState::enableCells()
+{
+#if NIX_USE_BOEHMGC
+    if (!mem.trackOwners)
+        throw Error("traced cells require 'EvalSettings::traceCells' to be set before the evaluator is created");
+    /* Owners of environments created in calls through a port point into
+       their instance (`CellInstance::inCall`); they must keep it alive. */
+    GC_register_displacement(offsetof(CellInstance, inCall));
+    cells = std::make_unique<CellTable>(*this);
+    stableRoots = std::make_unique<StableRoots>(store->storeDir);
+#else
+    throw Error("traced cells require Nix to be built with the Boehm garbage collector");
+#endif
+}
+
+size_t EvalState::fileEvalCacheSize() const
+{
+    return fileEvalCache->size();
+}
+
+void EvalState::dropImportResolutionUnder(std::string_view dir)
+{
+    auto under = [&](const SourcePath & path) {
+        return &*path.accessor == &*rootFS && path.path.abs().starts_with(dir);
+    };
+    importResolutionCache->erase_if([&](auto & entry) { return under(entry.first) || under(entry.second); });
+}
+
+void EvalState::dropFileCacheEntry(std::string_view path)
+{
+    fileEvalCache->erase(SourcePath{rootFS, CanonPath(path)});
+}
+
+void EvalState::dropFileCacheUnder(std::string_view dir)
+{
+    auto under = [&](const SourcePath & path) {
+        return &*path.accessor == &*rootFS && path.path.abs().starts_with(dir);
+    };
+    fileEvalCache->erase_if([&](auto & entry) { return under(entry.first); });
+    importResolutionCache->erase_if([&](auto & entry) { return under(entry.first) || under(entry.second); });
 }
 
 void EvalState::eval(Expr * e, Value & v)
@@ -1608,6 +1736,13 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
         if (vCur.isLambda()) {
 
             ExprLambda & lambda(*vCur.lambda().fun);
+
+            if (lambda.cellSite && cells) [[unlikely]] {
+                if (cells->call(*this, vCur, *args[0], vCur, pos)) {
+                    args = args.subspan(1);
+                    continue;
+                }
+            }
 
             auto size = (!lambda.arg ? 0 : 1) + (lambda.getFormals() ? lambda.getFormals()->formals.size() : 0);
             Env & env2(mem.allocEnv(size));
@@ -2238,6 +2373,13 @@ void ExprPos::eval(EvalState & state, Env & env, Value & v)
     state.mkPos(v, pos);
 }
 
+ExprLazyApp eLazyApp;
+
+void ExprLazyApp::eval(EvalState & state, Env & env, Value & v)
+{
+    state.callFunction(*env.values[0], *env.values[1], v, noPos);
+}
+
 void ExprBlackHole::eval(EvalState & state, [[maybe_unused]] Env & env, Value & v)
 {
     throwInfiniteRecursionError(state, v);
@@ -2246,6 +2388,49 @@ void ExprBlackHole::eval(EvalState & state, [[maybe_unused]] Env & env, Value & 
 [[gnu::noinline]] [[noreturn]] void ExprBlackHole::throwInfiniteRecursionError(EvalState & state, Value & v)
 {
     state.error<InfiniteRecursionError>(&v, "infinite recursion encountered").atPos(v.determinePos(noPos)).debugThrow();
+}
+
+void EvalState::forceValueTracked(Value & v, const PosIdx pos)
+{
+    auto savedOwner = mem.currentOwner;
+    if (v.isThunk()) {
+        Env * env = v.thunk().env;
+        assert(env || v.isBlackhole());
+        Expr * expr = v.thunk().expr;
+        try {
+            v.mkBlackhole();
+            if (env) [[likely]] {
+                mem.currentOwner = mem.ownerOf(*env);
+                expr->eval(*this, *env, v);
+            } else
+                ExprBlackHole::throwInfiniteRecursionError(*this, v);
+        } catch (...) {
+            mem.currentOwner = savedOwner;
+            handleEvalExceptionForThunk(env, expr, v, pos);
+            throw;
+        }
+        mem.currentOwner = savedOwner;
+    } else if (v.isApp()) {
+        Value savedApp = v;
+        /* An application has no environment. Applications created in a
+           traced cell's context are thunks (`mkLazyApp()`), so this one
+           was created by ordinary evaluation; it runs in the context of
+           the applied lambda's closure, if any. */
+        auto * fn = v.app().left;
+        while (fn->isApp())
+            fn = fn->app().left;
+        mem.currentOwner = fn->isLambda() ? mem.ownerOf(*fn->lambda().env) : nullptr;
+        try {
+            callFunction(*v.app().left, *v.app().right, v, pos);
+        } catch (...) {
+            mem.currentOwner = savedOwner;
+            handleEvalExceptionForApp(v, savedApp);
+            throw;
+        }
+        mem.currentOwner = savedOwner;
+    } else if (v.isFailed()) {
+        handleEvalFailed(v, pos);
+    }
 }
 
 // always force this to be separate, otherwise forceValue may inline it and take
@@ -2277,6 +2462,15 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
         recovery = allocValue();
     } catch (...) {
     }
+    if (speculative) [[unlikely]] {
+        /* Traced-cell validation forced this value although a cold
+           evaluation might never force it, so the error must not stick.
+           A black hole belongs to an evaluation further up the stack. */
+        if (!env)
+            return;
+        if (!recovery)
+            recovery = allocValue();
+    }
     if (recovery) {
         recovery->mkThunk(env, expr);
     }
@@ -2296,6 +2490,8 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
         recovery = allocValue();
     } catch (...) {
     }
+    if (speculative && !recovery) [[unlikely]]
+        recovery = allocValue();
     if (recovery) {
         *recovery = savedApp;
     }
@@ -2637,6 +2833,24 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
     if (nix::isDerivation(path.path.abs()))
         error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
 
+    if (stableRoots) [[unlikely]]
+        if (auto real = toRealPath(path); real != path) {
+            /* Copy from the current store path of the stable root: the
+               source-to-store cache is keyed by path, and the contents under
+               the stable path change between generations. The store object
+               is named after the real path, as in a cold evaluation. */
+            auto dstPath = copyPathToStore(context, real);
+            if (recordsFileReads(path))
+                recordFileRead(
+                    FileReadKind::Copy,
+                    path,
+                    fmt("%s\n%s\n%s",
+                        ContentAddressMethod(ContentAddressMethod::Raw::NixArchive).render(),
+                        real.baseName(),
+                        store->printStorePath(dstPath)));
+            return dstPath;
+        }
+
     auto dstPath = fetchToStore(
         fetchSettings,
         *store,
@@ -2963,8 +3177,11 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
     /* !!! Hack to support some old broken code that relies on pointer
        equality tests between sets.  (Specifically, builderDefs calls
        uniqList on a list of sets.)  Will remove this eventually. */
-    if (&v1 == &v2)
+    if (&v1 == &v2) {
+        if (cells) [[unlikely]]
+            cells->observeIdentity(v1);
         return true;
+    }
 
     // Special case type-compatibility between float and int
     if (v1.type() == nInt && v2.type() == nFloat)
@@ -3024,8 +3241,15 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
     }
 
-    /* Functions are incomparable. */
+    /* Functions are incomparable. The result would have been true for
+       identical values, so it depends on their identity. */
     case nFunction:
+        if (cells) [[unlikely]] {
+            cells->observeIdentity(v1);
+            cells->observeIdentity(v2);
+            if (cells->sameBacking(*this, v1, v2))
+                return true;
+        }
         return false;
 
     case nExternal:
@@ -3077,7 +3301,7 @@ void EvalState::maybePrintStats()
     }
 }
 
-void EvalState::printStatistics()
+json EvalState::getStatistics()
 {
     std::chrono::microseconds cpuTimeDuration = getCpuUserTime();
     float cpuTime = std::chrono::duration_cast<std::chrono::duration<float>>(cpuTimeDuration).count();
@@ -3099,10 +3323,6 @@ void EvalState::printStatistics()
     auto gcCycles = getGCCycles();
 #endif
 
-    auto outPath = getEnv("NIX_SHOW_STATS_PATH").value_or("-");
-    std::fstream fs;
-    if (outPath != "-")
-        fs.open(outPath, std::fstream::out);
     json topObj = json::object();
     topObj["cpuTime"] = cpuTime;
     topObj["time"] = {
@@ -3199,6 +3419,12 @@ void EvalState::printStatistics()
             });
         }
     }
+    return topObj;
+}
+
+void EvalState::printStatistics()
+{
+    auto topObj = getStatistics();
 
     if (getEnv("NIX_SHOW_SYMBOLS").value_or("0") != "0") {
         // XXX: overrides earlier assignment
@@ -3206,9 +3432,12 @@ void EvalState::printStatistics()
         auto & list = topObj["symbols"];
         symbols.dump([&](std::string_view s) { list.emplace_back(s); });
     }
+
+    auto outPath = getEnv("NIX_SHOW_STATS_PATH").value_or("-");
     if (outPath == "-") {
         std::cerr << topObj.dump(2) << std::endl;
     } else {
+        std::fstream fs(outPath, std::fstream::out);
         fs << topObj.dump(2) << std::endl;
     }
 }
@@ -3244,6 +3473,24 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path)
 Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv)
 {
     auto buffer = path.resolveSymlinks().readFile();
+
+    /* Files of stable roots keep their expressions while their contents
+       do not change, so that lambdas and positions keep their identity
+       when the tree changes. */
+    if (stableRoots && staticEnv == staticBaseEnv && &*path.accessor == &*rootFS) [[unlikely]]
+        if (stableRoots->findVirtual(path.path.abs())) {
+            auto key = std::string(path.path.abs());
+            auto hash = contentFingerprint(buffer);
+            stableRoots->contentHashes.insert_or_assign(key, hash);
+            auto & parsed = stableRoots->parsed[key];
+            if (parsed.second && parsed.first == hash)
+                return parsed.second;
+            buffer.append("\0\0", 2);
+            auto e = parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
+            parsed = {hash, e};
+            return e;
+        }
+
     // readFile hopefully have left some extra space for terminators
     buffer.append("\0\0", 2);
     return parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);

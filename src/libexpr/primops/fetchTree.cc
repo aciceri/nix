@@ -2,6 +2,7 @@
 #include "nix/fetchers/attrs.hh"
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/traced-cells.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/fetch-tree.hh"
 #include "nix/store/store-api.hh"
@@ -128,7 +129,15 @@ void emitTreeAttrs(
 {
     auto attrs = state.buildBindings(100);
 
-    state.mkStorePathString(storePath, attrs.alloc(state.s.outPath, callPos));
+    /* An unlocked input mounted at a stable root keeps its virtual path
+       in strings (see `EvalState::realizeStrings()`). */
+    if (auto * root =
+            state.stableRoots ? state.stableRoots->findReal(state.store->printStorePath(storePath)) : nullptr) {
+        NixStringContext context{
+            NixStringContextElem::Opaque{.path = state.store->parseStorePath(root->virtualPrefix)}};
+        attrs.alloc(state.s.outPath, callPos).mkString(root->virtualPrefix, context, state.mem);
+    } else
+        state.mkStorePathString(storePath, attrs.alloc(state.s.outPath, callPos));
 
     // FIXME: support arbitrary input attributes.
 

@@ -524,6 +524,11 @@ struct ExprLambda : Expr
     Symbol name;
     Symbol arg;
 
+    /**
+     * Applications of this lambda may be traced cells, see `CellTable`.
+     */
+    bool cellSite = false;
+
 private:
     bool hasFormals;
     bool ellipsis;
@@ -831,6 +836,25 @@ struct ExprBlackHole : Expr
 };
 
 extern ExprBlackHole eBlackHole;
+
+/**
+ * The application of `env.values[0]` to `env.values[1]`. Created by
+ * `EvalState::mkLazyApp()` instead of a `tApp` when the application must
+ * keep the context it was created in (see `EvalMemory::currentOwner`).
+ */
+struct ExprLazyApp : Expr
+{
+    void show(const SymbolTable & symbols, std::ostream & str) const override
+    {
+        str << "«application»";
+    }
+
+    void eval(EvalState & state, Env & env, Value & v) override;
+
+    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override {}
+};
+
+extern ExprLazyApp eLazyApp;
 
 class Exprs
 {
