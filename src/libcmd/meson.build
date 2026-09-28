@@ -78,6 +78,7 @@ sources = files(
   'command.cc',
   'common-eval-args.cc',
   'editor-for.cc',
+  'eval-daemon-client.cc',
   'get-build-log.cc',
   'installable-attr-path.cc',
   'installable-derived-path.cc',

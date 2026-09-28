@@ -1,6 +1,8 @@
 #include "nix/util/current-process.hh"
 #include "run.hh"
 #include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/eval-daemon-client.hh"
+#include "nix/cmd/installable-flake.hh"
 #include "nix/main/shared.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/store-api.hh"
@@ -154,7 +156,13 @@ struct CmdRun : InstallableValueCommand, MixEnvironment
         auto state = getEvalState();
 
         lockFlags.applyNixConfig = true;
-        auto app = installable->toApp(*state).resolve(getEvalStore(), store);
+        auto unresolved = [&]() -> UnresolvedApp {
+            if (auto flake = installable.dynamic_pointer_cast<InstallableFlake>())
+                if (auto delegated = eval_daemon::app(*flake))
+                    return UnresolvedApp{std::move(*delegated)};
+            return installable->toApp(*state);
+        }();
+        auto app = unresolved.resolve(getEvalStore(), store);
 
         Strings allArgs{app.program.string()};
         for (auto & i : args)

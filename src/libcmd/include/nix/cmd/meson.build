@@ -12,6 +12,7 @@ headers = files(
   'get-build-log.hh',
   'installable-attr-path.hh',
   'installable-derived-path.hh',
+  'eval-daemon-client.hh',
   'installable-flake.hh',
   'installable-value.hh',
   'installables.hh',

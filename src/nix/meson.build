@@ -131,6 +131,7 @@ nix_sources = [ config_priv_h ] + files(
 if host_machine.system() != 'windows'
   nix_sources += files(
     'unix/daemon.cc',
+    'unix/eval-daemon.cc',
     'unix/store-roots-daemon.cc',
   )
 endif

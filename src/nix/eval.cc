@@ -1,4 +1,6 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/eval-daemon-client.hh"
+#include "nix/cmd/installable-flake.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -63,6 +65,27 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             throw UsageError("--raw and --json are mutually exclusive");
 
         auto state = getEvalState();
+
+        /* A running evaluation daemon renders the value itself (see
+           `eval-daemon-socket`). */
+        if (!apply && !writeTo)
+            if (auto flake = installable.dynamic_pointer_cast<InstallableFlake>()) {
+                if (raw) {
+                    if (auto s = eval_daemon::rawString(*flake)) {
+                        logger->stop();
+                        writeFull(getStandardOutput(), *s);
+                        return;
+                    }
+                } else if (json) {
+                    if (auto j = eval_daemon::jsonValue(*flake)) {
+                        printJSON(*j);
+                        return;
+                    }
+                } else if (auto s = eval_daemon::nixString(*flake)) {
+                    logger->cout("%s", *s);
+                    return;
+                }
+            }
 
         auto [v, pos] = installable->toValue(*state, AutoCall::No);
         NixStringContext context;

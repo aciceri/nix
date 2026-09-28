@@ -1,4 +1,5 @@
 #include "nix/cmd/installable-flake.hh"
+#include "nix/cmd/eval-daemon-client.hh"
 #include "nix/store/outputs-spec.hh"
 #include "nix/util/util.hh"
 #include "nix/cmd/command.hh"
@@ -67,6 +68,9 @@ InstallableFlake::InstallableFlake(
 
 DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 {
+    if (auto delegated = eval_daemon::derivedPaths(*this))
+        return std::move(*delegated);
+
     Activity act(*logger, lvlTalkative, actUnknown, fmt("evaluating derivation '%s'", what()));
 
     auto attr = getCursor(*state, AutoCall::No);

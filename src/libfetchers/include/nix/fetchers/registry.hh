@@ -50,6 +50,11 @@ typedef std::vector<std::shared_ptr<Registry>> Registries;
 
 std::shared_ptr<Registry> getUserRegistry(const Settings & settings);
 
+/**
+ * The registry of `--override-flake` and `--inputs-from` entries.
+ */
+std::shared_ptr<Registry> getFlagRegistry();
+
 std::shared_ptr<Registry> getCustomRegistry(const Settings & settings, const std::filesystem::path & p);
 
 std::filesystem::path getUserRegistryPath();

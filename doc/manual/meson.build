@@ -276,6 +276,7 @@ nix3_manpages = [
   'nix3-env',
   'nix3-env-shell',
   'nix3-eval',
+  'nix3-eval-daemon',
   'nix3-flake',
   'nix3-flake-archive',
   'nix3-flake-check',

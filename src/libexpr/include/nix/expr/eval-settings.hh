@@ -323,6 +323,32 @@ public:
             Intermediate results are not cached.
         )"};
 
+    Setting<std::string> evalDaemonSocket{
+        this,
+        "",
+        "eval-daemon-socket",
+        R"(
+          The Unix domain socket of a running [`nix eval-daemon`](@docroot@/command-ref/new-cli/nix3-eval-daemon.md).
+          If set, every command that evaluates a flake output (`nix build`, `nix eval`, `nix run`, `nix develop`,
+          `nix path-info`, `nix derivation show`, ...) asks the daemon for the result instead of evaluating it,
+          and evaluates locally, saying so at the informational level (`-v` on a terminal), when the daemon
+          cannot honour the request exactly.
+
+          - Passed along: the flake reference, the attribute paths, the outputs, `--override-input`,
+            `--update-input`, `--no-write-lock-file`, `--no-update-lock-file`, `--no-registries`, the system,
+            the store directory, and the settings `read-only`, `pure-eval`, `restrict-eval`,
+            `allow-import-from-derivation`, `max-call-depth`, `use-registries`, `flake-registry`, `tarball-ttl`
+            and `experimental-features`.
+          - Evaluated locally: `--impure`, `--expr`, `--override-flake`, other lock-file flags,
+            `nix eval --apply` or `--write-to`, a flake whose `nixConfig` changes the settings above (the
+            command applies it as usual), a daemon whose system, store directory
+            or settings above differ, a daemon that does not answer or is not run by this user or root, and
+            derivations the daemon returns that are not valid in the store.
+        )",
+        {},
+        true,
+        Xp::EvalDaemon};
+
     Setting<bool> ignoreExceptionsDuringTry{
         this,
         false,
